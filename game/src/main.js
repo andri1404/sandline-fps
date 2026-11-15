@@ -44,7 +44,7 @@ document.getElementById('game').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 20, 52);
+scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 24, 68);
 const camera = new THREE.PerspectiveCamera(BASE_FOV, window.innerWidth / window.innerHeight, 0.05, 160);
 scene.add(camera);
 
@@ -57,7 +57,7 @@ const player = createPlayer(world.collides);
 const input = createInput(renderer.domElement, onLockChange);
 const audio = createAudio();
 const economy = createEconomy();
-const bomb = createBomb(scene, world.site);
+const bomb = createBomb(scene, world.sites);
 const grenades = createGrenades(scene, world);
 const rounds = createRounds();
 
@@ -198,6 +198,12 @@ function pushNoise(x, z, radius) {
   if (game.noise.length > 8) game.noise.shift();
 }
 
+// Where the bomb is: the planted site, or Site A while it is still in hand.
+function bombPos() {
+  const site = bomb.state.site ? world.sites[bomb.state.site] : world.sites.A;
+  return { x: site.x, z: site.z };
+}
+
 function botContext() {
   return {
     playerPos: body.position,
@@ -213,9 +219,12 @@ function botContext() {
     noise: game.noise,
     smokeBlocks: (ax, ay, az, bx, by, bz) => grenades.blocksLOS(ax, ay, az, bx, by, bz),
     bombPlanted: bomb.state.status === 'planted',
-    bomb: { x: world.site.x, z: world.site.z },
+    bomb: bombPos(),
+    throwGrenade: (kind, from, dir) => grenades.throwGrenade(kind, from, dir),
     onAgentShot: (agent, origin, dir) => {
-      audio.shot('bot');
+      // Distant shots sound distant: the crack fades with range.
+      const d = Math.hypot(agent.position.x - body.position.x, agent.position.z - body.position.z);
+      audio.shot('bot', Math.max(0.25, Math.min(1, 1 - d / 45)));
       spawnTracer(origin, dir, 40);
     },
     onKillFeed: (text) => hud.killfeed(text),
@@ -241,16 +250,19 @@ function mateContext() {
     // built, before thinkMate runs — a plant started this step still reads
     // as 'idle' through them.
     bombLive: () => bomb.state.status,
-    bomb: { x: world.site.x, z: world.site.z },
-    inSite: (x, z) => world.inSite(x, z),
+    bomb: bombPos(),
+    bombSite: bomb.state.site,
+    siteAt: (x, z) => world.siteAt(x, z),
+    throwGrenade: (kind, from, dir) => grenades.throwGrenade(kind, from, dir),
     onAgentShot: (agent, origin, dir) => {
-      audio.shot('bot');
+      const d = Math.hypot(agent.position.x - body.position.x, agent.position.z - body.position.z);
+      audio.shot('bot', Math.max(0.25, Math.min(1, 1 - d / 45)));
       spawnTracer(origin, dir, 40);
     },
     onKillFeed: (text) => hud.killfeed(text),
     onDefenderDown: () => checkCombatEnd(),
-    onMateStartPlant: (mate) => {
-      if (bomb.state.status === 'idle') bomb.startPlant(mate);
+    onMateStartPlant: (mate, site) => {
+      if (bomb.state.status === 'idle') bomb.startPlant(mate, site);
     },
     onMateCancelPlant: (mate) => {
       if (bomb.state.status === 'planting' && bomb.state.planter === mate) bomb.cancelPlant();
@@ -266,6 +278,25 @@ function squadList() {
   const list = [{ name: 'YOU', hp: game.health, alive: game.alive, you: true }];
   for (const m of mates.mates) list.push({ name: m.name, hp: m.health, alive: m.alive, you: false });
   return list;
+}
+
+// One minimap payload for every caller: player, squad, defenders, both sites,
+// and the map bounds the HUD scales from.
+function minimapData() {
+  return {
+    px: body.position.x,
+    pz: body.position.z,
+    yaw: body.yaw,
+    mates: mates.mates,
+    foes: bots.bots,
+    planted: bomb.state.status === 'planted',
+    plantedSite: bomb.state.site,
+    bounds: world.bounds,
+    sites: [
+      { x: world.sites.A.x, z: world.sites.A.z, hw: world.sites.A.halfW, hd: world.sites.A.halfD, label: 'A' },
+      { x: world.sites.B.x, z: world.sites.B.z, hw: world.sites.B.halfW, hd: world.sites.B.halfD, label: 'B' },
+    ],
+  };
 }
 
 // The round can end on any kill: all defenders down wins it, a wiped squad
@@ -308,6 +339,11 @@ function damagePlayer(damage, isHead, bot) {
   if (economy.state.armor) amount = Math.max(1, Math.round(amount * 0.5));
   game.health -= amount;
   hud.damageFlash();
+  // Direction indicator: the ring around the crosshair flashes toward the
+  // shooter, so the player knows where the fire came from.
+  const dx = bot.position.x - body.position.x;
+  const dz = bot.position.z - body.position.z;
+  hud.damageDirection(body.yaw - Math.atan2(-dx, -dz));
   audio.hurt();
   hud.setHealth(game.health, economy.state.armor);
   if (game.health <= 0) {
@@ -498,9 +534,9 @@ function step(dt) {
     const tick = rounds.tick(dt);
     if (tick === 'live') {
       hud.hideBuy();
-      hud.banner(`ROUND ${rounds.state.round}`, 'Plant the charge at Site A — or clear the defenders.', 2200);
+      hud.banner(`ROUND ${rounds.state.round}`, 'Plant the charge at Site A or Site B — or clear the defenders.', 2200);
     } else if (tick === 'timeout' && phase === 'live' && bomb.state.status !== 'planted') {
-      endRound(false, 'Time expired — Site A holds.');
+      endRound(false, 'Time expired — the sites hold.');
     }
   }
 
@@ -542,18 +578,18 @@ function step(dt) {
           hud.setGrenades(economy.state.flash, economy.state.smoke, game.grenade);
         }
       }
-      // Plant: hold E inside Site A. Only the player's own plant is
+      // Plant: hold E inside a site. Only the player's own plant is
       // cancelled here — a teammate planting must not be cut off by the
       // player simply not holding E.
-      const inSite = world.inSite(body.position.x, body.position.z);
-      if (input.state.keys.has('KeyE') && inSite && bomb.state.status === 'idle') bomb.startPlant();
+      const site = world.siteAt(body.position.x, body.position.z);
+      if (input.state.keys.has('KeyE') && site && bomb.state.status === 'idle') bomb.startPlant('player', site);
       if (bomb.state.status === 'planting' && bomb.state.planter === 'player') {
-        if (!input.state.keys.has('KeyE') || !inSite || !game.alive) bomb.cancelPlant();
+        if (!input.state.keys.has('KeyE') || !site || !game.alive) bomb.cancelPlant();
       }
     }
   }
 
-  weapons.step(dt, input.state.aiming && game.alive);
+  weapons.step(dt, input.state.aiming && game.alive, player.groundSpeed());
   // Bots and teammates freeze during the buy phase; they only play once the
   // round is live.
   if (phase === 'live' || phase === 'aftermath') bots.step(dt, game.elapsed, botContext());
@@ -564,7 +600,7 @@ function step(dt) {
   if (bombEvent === 'detonated') {
     audio.explosion();
     if (rounds.state.phase === 'live' || rounds.state.phase === 'aftermath') {
-      endRound(true, 'The charge blew Site A.');
+      endRound(true, `The charge blew Site ${bomb.state.site}.`);
     }
   }
   if (bomb.state.status === 'planted' && game.prevBomb === 'planting') {
@@ -625,16 +661,10 @@ function frame(now) {
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSlots(weapons.def().name, weapons.state.slot);
     hud.setSquad(squadList(), bots.aliveCount());
-    hud.drawMinimap({
-      px: body.position.x,
-      pz: body.position.z,
-      yaw: body.yaw,
-      mates: mates.mates,
-      foes: bots.bots,
-      planted: bomb.state.status === 'planted',
-    });
+    hud.drawMinimap(minimapData());
     updateTracers(dt);
     updateImpacts(dt);
+    world.updateDust(dt);
     if (phase === 'buy') hud.setTimer(rounds.state.freeze, 'buy');
     else if (bomb.state.status === 'planted') hud.setTimer(bomb.state.fuse, 'aftermath');
     else if (phase === 'live') hud.setTimer(rounds.state.timer, 'live');
@@ -687,7 +717,7 @@ function runShot(name) {
     hud.showOverlay('start');
     hud.setTimer(100, 'live');
     hud.setSquad(squadList(), bots.aliveCount());
-    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
+    hud.drawMinimap(minimapData());
   } else if (name === 'play') {
     rounds.startMatch();
     rounds.state.phase = 'live';
@@ -737,7 +767,7 @@ function runShot(name) {
     hud.setTimer(83, 'live');
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSquad(squadList(), bots.aliveCount());
-    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
+    hud.drawMinimap(minimapData());
   } else if (name === 'buy') {
     rounds.startMatch();
     economy.add(3050);
@@ -765,15 +795,15 @@ function runShot(name) {
     hud.setSlots(weapons.def().name, 1);
     hud.setScore(1, 0, 2);
     hud.setSquad(squadList(), bots.aliveCount());
-    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
+    hud.drawMinimap(minimapData());
     syncCamera();
   } else {
-    // end: round won at the site, all five defenders down.
+    // end: round won at Site B, all five defenders down.
     rounds.startMatch();
     rounds.state.wins = 2;
     rounds.state.losses = 1;
     rounds.state.round = 4;
-    const fallenSpots = [[-3.4, -13.2], [2.8, -15.8], [-1.2, -11.0], [-9.5, -4.5], [9.8, -5.2]];
+    const fallenSpots = [[24.6, -13.2], [30.8, -15.8], [26.8, -11.0], [22.5, -6.5], [28.5, -6.0]];
     bots.bots.forEach((bot, i) => {
       bot.position.set(fallenSpots[i][0], 0, fallenSpots[i][1]);
       bot.alive = false;
@@ -783,7 +813,7 @@ function runShot(name) {
     });
     // The squad holds the site they just took: four teammates alive, and
     // VIPER takes the MVP for the round.
-    const mateSpots = [[-2, -13], [2, -13], [-2, -16], [2, -16]];
+    const mateSpots = [[26, -13], [30, -13], [26, -16], [30, -16]];
     mates.mates.forEach((mate, i) => {
       mate.position.set(mateSpots[i][0], 0, mateSpots[i][1]);
       mate.yaw = Math.PI;
@@ -793,7 +823,7 @@ function runShot(name) {
     mates.mates[0].kills = 2;
     mates.mates[1].kills = 1;
     game.kills = 1;
-    player.reset(-1.5, -8.5, 0.1);
+    player.reset(26.5, -8.5, 0.1);
     body.pitch = -0.02;
     settle(20);
     syncCamera();
@@ -803,7 +833,7 @@ function runShot(name) {
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSlots('VK-47', 1);
     hud.setSquad(squadList(), bots.aliveCount());
-    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
+    hud.drawMinimap(minimapData());
     hud.showOverlay('roundEnd', { title: 'Round won', copy: `All defenders down. Score 2 — 1. ${mvpLine()}`, action: 'Next round' });
   }
   paintTwiceThenReady();

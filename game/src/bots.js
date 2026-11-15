@@ -26,36 +26,55 @@ const DEFUSE_SECONDS = 5;
 const PLANT_SECONDS = 3;
 const FALL_SECONDS = 0.45;
 
-const ROLES = ['site', 'site', 'mid', 'west', 'east'];
+const ROLES = ['siteA', 'siteA', 'siteB', 'siteB', 'mid'];
 const HOLD_SPOTS = [
   [-6, -13.5],
   [6, -13.5],
+  [24, -13.5],
+  [32, -13.5],
   [0, -6],
-  [-13, 0],
-  [13, 0],
 ];
 const PATROLS = [
   [[6, -14], [-6, -14], [0, -12]],
   [[-6, -14], [6, -14], [0, -16]],
-  [[0, -8], [0, 2], [0, -8], [0, 4]],
-  [[-13, 8], [-13, -7], [-13, 3]],
-  [[13, 8], [13, -7], [13, 3]],
+  [[32, -14], [24, -14], [28, -12]],
+  [[24, -14], [32, -14], [28, -16]],
+  [[0, -8], [0, 2], [7, -8], [0, -8], [13, -7]],
 ];
 
 const TEAM_NAMES = ['VIPER', 'JINX', 'ORYX', 'NOVA'];
 const TEAM_TORSO = ['ink', 'muted', 'surface', 'hairline'];
-const TEAM_PATROLS = [
-  [[0, 15], [0, 8], [0, 0], [0, -8], [0, -14]], // VIPER: mid
-  [[-2, 15], [-8, 14], [-13, 9], [-13, 3], [-13, -7], [-7, -8], [0, -14]], // JINX: west
-  [[2, 15], [8, 14], [13, 9], [13, 3], [13, -7], [7, -8], [0, -14]], // ORYX: east
-  [[1, 15], [7, 5], [0, 0], [0, -8], [0, -14]], // NOVA: mid support
+// One push route per mate per site. VIPER and JINX default to Site A, ORYX and
+// NOVA to Site B, so the squad splits and the defenders cannot stack one site.
+const TEAM_PATROLS_A = [
+  [[0, 15], [0, 8], [0, 0], [0, -8], [0, -14]], // VIPER: mid to A
+  [[-2, 15], [-8, 14], [-13, 9], [-13, 3], [-13, -7], [-7, -8], [0, -14]], // JINX: west to A
+  [[2, 15], [8, 14], [13, 9], [13, 3], [13, -7], [7, -8], [0, -14]], // ORYX: east to A
+  [[1, 15], [7, 5], [0, 0], [0, -8], [0, -14]], // NOVA: mid to A
 ];
-const TEAM_HOLD = [
+const TEAM_PATROLS_B = [
+  [[0, 15], [0, 8], [0, 0], [0, -8], [7, -8], [13, -7], [23, -7], [28, -14]], // VIPER: mid, east wing to B
+  [[-2, 15], [-8, 14], [-13, 9], [-13, 3], [-13, -7], [0, -8], [7, -8], [13, -7], [23, -7], [28, -14]], // JINX: west, across to B
+  [[2, 15], [8, 14], [13, 9], [13, 3], [13, -7], [23, -7], [28, -7], [28, -14]], // ORYX: east lane to B
+  [[1, 15], [7, 5], [0, 0], [0, -8], [7, -8], [13, -7], [23, -7], [28, -7], [28, -14]], // NOVA: mid, east wing to B
+];
+const TEAM_HOLD_A = [
   [-2, -13],
   [2, -13],
   [-2, -16],
   [2, -16],
 ];
+const TEAM_HOLD_B = [
+  [26, -13],
+  [30, -13],
+  [26, -16],
+  [30, -16],
+];
+const TEAM_DEFAULT_SITE = ['A', 'A', 'B', 'B'];
+
+function holdSpotFor(site, index) {
+  return site === 'B' ? TEAM_HOLD_B[index] : TEAM_HOLD_A[index];
+}
 
 function nearestNode(waypoints, x, z) {
   let best = 0;
@@ -140,6 +159,7 @@ export function createBots(scene, world, random) {
   const bots = [];
   const hitMeshes = [];
   let now = 0;
+  let retakeFlashThrown = false; // one covering flash per planted bomb
 
   const eye = new THREE.Vector3();
   const toTarget = new THREE.Vector3();
@@ -218,6 +238,7 @@ export function createBots(scene, world, random) {
       speed: PATROL_SPEED,
       kills: 0,
       calloutAt: 0,
+      flashLeft: 1, // one flashbang per round, lobbed at a noise or a retake
     };
   }
 
@@ -226,7 +247,7 @@ export function createBots(scene, world, random) {
     bot.role = ROLES[index];
     bot.holdSpot = HOLD_SPOTS[index];
     bot.patrol = PATROLS[index];
-    bot.state = bot.role === 'site' ? 'hold' : 'patrol';
+    bot.state = bot.role === 'mid' ? 'patrol' : 'hold';
     bot.torso.userData.bot = bot;
     bot.head.userData.bot = bot;
     hitMeshes.push(bot.torso, bot.head);
@@ -262,6 +283,17 @@ export function createBots(scene, world, random) {
       bestD = d;
     }
     return best;
+  }
+
+  // Lob a grenade from an agent toward a point: the throw arcs up so it clears
+  // the cover between them. Consumes one of the agent's grenades.
+  function throwAt(agent, kind, tx, tz, ctx) {
+    if (!ctx.throwGrenade) return;
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    toTarget.set(tx - eye.x, 1.2 - eye.y, tz - eye.z).normalize();
+    toTarget.y += 0.35;
+    toTarget.normalize();
+    ctx.throwGrenade(kind, eye, toTarget);
   }
 
   function setPath(agent, x, z) {
@@ -457,6 +489,12 @@ export function createBots(scene, world, random) {
           bot.state = 'investigate';
           bot.investigateAt = now;
           setPath(bot, event.x, event.z);
+          // Lob a flash at the noise when it is close enough: the push in
+          // is covered instead of walked blind.
+          if (bot.flashLeft > 0 && Math.hypot(dx, dz) < 25 && random() < 0.5) {
+            throwAt(bot, 'flash', event.x, event.z, ctx);
+            bot.flashLeft -= 1;
+          }
           break;
         }
       }
@@ -486,8 +524,38 @@ export function createBots(scene, world, random) {
         walkPath(bot, dt, HUNT_SPEED);
       } else {
         bot.yaw = Math.atan2(-dx, -dz);
-        bot.defuseT += dt;
-        if (bot.defuseT >= DEFUSE_SECONDS) ctx.onDefused(bot);
+        // Group retake: only start the defuse when another defender is close
+        // enough to cover, or when this bot is the last one standing. Walking
+        // onto a held site alone to defuse is how retakes are lost.
+        const others = bots.filter((b) => b.alive && b !== bot);
+        const backupNear = others.length === 0 || others.some((b) => {
+          const bx = ctx.bomb.x - b.position.x;
+          const bz = ctx.bomb.z - b.position.z;
+          return bx * bx + bz * bz < 12 * 12;
+        });
+        if (backupNear) {
+          bot.defuseT += dt;
+          if (bot.defuseT >= DEFUSE_SECONDS) ctx.onDefused(bot);
+        } else {
+          bot.yaw += Math.sin(now * 0.5 + bot.index * 2.1) * 0.0035;
+        }
+      }
+      bot.group.position.copy(bot.position);
+      bot.group.rotation.y = bot.yaw;
+      return;
+    }
+
+    if (bot.state === 'retake') {
+      // Converge on the planted site together. On arrival, hold the ground
+      // taken and cover the defuser instead of piling onto the bomb.
+      const dx = ctx.bomb.x - bot.position.x;
+      const dz = ctx.bomb.z - bot.position.z;
+      if (Math.hypot(dx, dz) > 2.5) {
+        setPath(bot, ctx.bomb.x, ctx.bomb.z);
+        walkPath(bot, dt, HUNT_SPEED);
+      } else {
+        bot.state = 'hold';
+        bot.holdSpot = [bot.position.x, bot.position.z];
       }
       bot.group.position.copy(bot.position);
       bot.group.rotation.y = bot.yaw;
@@ -536,7 +604,7 @@ export function createBots(scene, world, random) {
       // be reached (or a last-known that keeps sliding) must not pin the
       // agent in place for the rest of the round.
       if (walkPath(bot, dt, HUNT_SPEED) || now - bot.investigateAt > 8) {
-        bot.state = bot.role === 'site' ? 'hold' : 'patrol';
+        bot.state = bot.role === 'mid' ? 'patrol' : 'hold';
         bot.patrolIdx = 0;
       }
       bot.group.position.copy(bot.position);
@@ -578,7 +646,10 @@ export function createBots(scene, world, random) {
     step(dt, time, ctx) {
       now = time;
       for (const bot of bots) stepDefender(bot, dt, ctx);
-      // After the bomb is planted, the closest living defender goes to defuse it.
+      // After the bomb is planted the defenders retake as a group: the
+      // closest free defender becomes the defuser, the rest converge on the
+      // site together instead of trickling in one by one. If the defuser
+      // dies, the next closest free defender takes over.
       if (ctx.bombPlanted) {
         let defuser = null;
         for (const bot of bots) if (bot.alive && bot.state === 'defuse') defuser = bot;
@@ -587,6 +658,7 @@ export function createBots(scene, world, random) {
           let bestDist = Infinity;
           for (const bot of bots) {
             if (!bot.alive) continue;
+            if (bot.state === 'engage' || bot.state === 'dead') continue;
             const dx = ctx.bomb.x - bot.position.x;
             const dz = ctx.bomb.z - bot.position.z;
             const d = dx * dx + dz * dz;
@@ -598,8 +670,39 @@ export function createBots(scene, world, random) {
           if (best) {
             best.state = 'defuse';
             best.defuseT = 0;
+            defuser = best;
           }
         }
+        for (const bot of bots) {
+          if (!bot.alive || bot === defuser) continue;
+          if (bot.state === 'hold' || bot.state === 'patrol' || bot.state === 'investigate') {
+            bot.state = 'retake';
+            bot.path = null;
+          }
+        }
+        // One flash to cover the push in: the closest retaker with a flash
+        // left lobs it at the site as the group moves.
+        if (!retakeFlashThrown) {
+          let best = null;
+          let bestDist = Infinity;
+          for (const bot of bots) {
+            if (!bot.alive || bot === defuser || bot.state !== 'retake' || bot.flashLeft <= 0) continue;
+            const dx = ctx.bomb.x - bot.position.x;
+            const dz = ctx.bomb.z - bot.position.z;
+            const d = dx * dx + dz * dz;
+            if (d < bestDist) {
+              bestDist = d;
+              best = bot;
+            }
+          }
+          if (best && bestDist < 30 * 30 && random() < 0.7) {
+            throwAt(best, 'flash', ctx.bomb.x, ctx.bomb.z, ctx);
+            best.flashLeft -= 1;
+          }
+          retakeFlashThrown = true;
+        }
+      } else {
+        retakeFlashThrown = false;
       }
     },
     damage(mesh, amount) {
@@ -622,7 +725,7 @@ export function createBots(scene, world, random) {
         bot.yaw = Math.PI;
         bot.health = HEALTH;
         bot.alive = true;
-        bot.state = bot.role === 'site' ? 'hold' : 'patrol';
+        bot.state = bot.role === 'mid' ? 'patrol' : 'hold';
         bot.target = null;
         bot.patrolIdx = 0;
         bot.path = null;
@@ -640,6 +743,7 @@ export function createBots(scene, world, random) {
         bot.blindUntil = 0;
         bot.kills = 0;
         bot.calloutAt = 0;
+        bot.flashLeft = 1;
         bot.group.rotation.set(0, bot.yaw, 0);
         bot.group.position.copy(bot.position);
         bot.torsoMat.emissiveIntensity = 0;
@@ -704,8 +808,8 @@ export function createTeammates(scene, world, random) {
       health: HEALTH,
       alive: true,
       state: 'patrol',
-      holdSpot: TEAM_HOLD[index],
-      patrol: TEAM_PATROLS[index],
+      holdSpot: TEAM_HOLD_A[index],
+      patrol: TEAM_PATROLS_A[index],
       patrolIdx: 0,
       path: [],
       pathIdx: 0,
@@ -730,6 +834,11 @@ export function createTeammates(scene, world, random) {
       speed: PATROL_SPEED,
       kills: 0,
       calloutAt: 0,
+      smokeLeft: 1, // one smoke per round, thrown to cover a push
+      targetSite: TEAM_DEFAULT_SITE[index],
+      fakeSite: null, // the site this mate pretends to push, if faking
+      fakeUntil: 0, // 0 = fake not started yet this round
+      plantSite: null, // the site this mate is planting at, if any
     };
   }
 
@@ -765,6 +874,21 @@ export function createTeammates(scene, world, random) {
     return best;
   }
 
+  function nearestPatrolIndex(patrol, x, z) {
+    let best = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < patrol.length; i += 1) {
+      const dx = patrol[i][0] - x;
+      const dz = patrol[i][1] - z;
+      const d = dx * dx + dz * dz;
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
   function nearestDefenderWithin(agent, ctx, radius) {
     for (const def of ctx.defenders) {
       if (!def.alive) continue;
@@ -773,6 +897,17 @@ export function createTeammates(scene, world, random) {
       if (dx * dx + dz * dz < radius * radius) return true;
     }
     return false;
+  }
+
+  // Lob a grenade from a mate toward a point: the throw arcs up so it clears
+  // the cover between them. Consumes one of the mate's grenades.
+  function throwAt(agent, kind, tx, tz, ctx) {
+    if (!ctx.throwGrenade) return;
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    toTarget.set(tx - eye.x, 1.2 - eye.y, tz - eye.z).normalize();
+    toTarget.y += 0.35;
+    toTarget.normalize();
+    ctx.throwGrenade(kind, eye, toTarget);
   }
 
   function setPath(agent, x, z) {
@@ -928,6 +1063,28 @@ export function createTeammates(scene, world, random) {
     if (now < mate.thinkAt) return;
     mate.thinkAt = now + 0.12 + random() * 0.06;
     if (now < mate.blindUntil) return;
+    // Fake push: a mate assigned to fake starts on the other site's route
+    // and rotates to the real target after 12 s, dragging defenders with it.
+    // The patrol resumes from its nearest node, never from the spawn.
+    if (mate.fakeSite) {
+      if (mate.fakeUntil === 0) mate.fakeUntil = now + 12;
+      else if (now >= mate.fakeUntil) {
+        mate.fakeSite = null;
+        mate.fakeUntil = 0;
+        mate.patrol = mate.targetSite === 'B' ? TEAM_PATROLS_B[mate.index] : TEAM_PATROLS_A[mate.index];
+        mate.patrolIdx = nearestPatrolIndex(mate.patrol, mate.position.x, mate.position.z);
+        mate.path = null;
+        mate.holdSpot = holdSpotFor(mate.targetSite, mate.index);
+        callout(mate, ctx, `${mate.name}: Rotating to Site ${mate.targetSite}!`);
+      }
+    }
+    // The bomb is down at a site: stop pushing the other one and go hold the
+    // plant instead of arriving late.
+    if (ctx.bombPlanted && mate.state === 'patrol') {
+      mate.state = 'hold';
+      mate.holdSpot = holdSpotFor(ctx.bombSite, mate.index);
+      mate.path = null;
+    }
     const seen = pickDefender(mate, ctx);
     if (seen) {
       mate.lastKnown.set(seen.position.x, 0, seen.position.z);
@@ -937,6 +1094,15 @@ export function createTeammates(scene, world, random) {
         mate.reactionAt = now + 0.35 + random() * 0.3;
         mate.burstLeft = 0;
         callout(mate, ctx, `${mate.name}: Contact — ${seen.name} in sight!`);
+        // Smoke the push when the fight is at range: cover the advance
+        // instead of trading shots across open ground.
+        if (mate.smokeLeft > 0) {
+          const d = Math.hypot(seen.position.x - mate.position.x, seen.position.z - mate.position.z);
+          if (d > 8 && d < 26 && random() < 0.4) {
+            throwAt(mate, 'smoke', seen.position.x, seen.position.z, ctx);
+            mate.smokeLeft -= 1;
+          }
+        }
       }
       mate.target = seen;
       mate.loseSightAt = now + 1.2;
@@ -948,13 +1114,15 @@ export function createTeammates(scene, world, random) {
       mate.target = null;
       setPath(mate, mate.lastKnown.x, mate.lastKnown.z);
     }
-    // Reach Site A with the coast clear and the bomb still in hand: plant it.
+    // Reach a site with the coast clear and the bomb still in hand: plant it.
     // Only from a calm state — never mid-fight.
-    if ((mate.state === 'patrol' || mate.state === 'hold') && ctx.bombLive() === 'idle' && ctx.inSite(mate.position.x, mate.position.z) && !nearestDefenderWithin(mate, ctx, 14)) {
+    const site = ctx.siteAt ? ctx.siteAt(mate.position.x, mate.position.z) : null;
+    if (site && (mate.state === 'patrol' || mate.state === 'hold') && ctx.bombLive() === 'idle' && !nearestDefenderWithin(mate, ctx, 14)) {
       mate.state = 'plant';
       mate.plantT = 0;
-      callout(mate, ctx, `${mate.name}: Planting at Site A — cover me!`);
-      ctx.onMateStartPlant(mate);
+      mate.plantSite = site;
+      callout(mate, ctx, `${mate.name}: Planting at Site ${site} — cover me!`);
+      ctx.onMateStartPlant(mate, site);
     }
     if (mate.state !== 'engage' && ctx.noise) {
       for (const event of ctx.noise) {
@@ -996,11 +1164,13 @@ export function createTeammates(scene, world, random) {
       const close = nearestDefenderWithin(mate, ctx, 12);
       const seen = close ? pickDefender(mate, ctx) : null;
       const live = ctx.bombLive();
+      const siteNow = ctx.siteAt ? ctx.siteAt(mate.position.x, mate.position.z) : null;
       if (live === 'planted') {
         // The charge is in — hold the site.
         mate.state = 'hold';
         mate.target = null;
-      } else if (close || !ctx.inSite(mate.position.x, mate.position.z) || live !== 'planting') {
+        mate.holdSpot = holdSpotFor(ctx.bombSite, mate.index);
+      } else if (close || siteNow !== mate.plantSite || live !== 'planting') {
         if (live === 'planting') ctx.onMateCancelPlant(mate);
         mate.state = seen ? 'engage' : 'patrol';
         mate.target = seen || null;
@@ -1057,6 +1227,7 @@ export function createTeammates(scene, world, random) {
       // Same 8 s give-up as the defenders: never pin the squad in place.
       if (walkPath(mate, dt, HUNT_SPEED) || now - mate.investigateAt > 8) {
         mate.state = ctx.bombPlanted ? 'hold' : 'patrol';
+        if (ctx.bombPlanted) mate.holdSpot = holdSpotFor(ctx.bombSite, mate.index);
         mate.patrolIdx = 0;
       }
       mate.group.position.copy(mate.position);
@@ -1106,6 +1277,9 @@ export function createTeammates(scene, world, random) {
       return mates.filter((mate) => mate.alive).length;
     },
     reset(spawns) {
+      // One fake per round at most: a 30% roll picks one mate to start on the
+      // other site's route and rotate to the real target after 12 s.
+      const fakeIdx = random() < 0.3 ? Math.floor(random() * mates.length) : -1;
       for (let i = 0; i < mates.length; i += 1) {
         const mate = mates[i];
         const spawn = spawns[i % spawns.length];
@@ -1131,6 +1305,14 @@ export function createTeammates(scene, world, random) {
         mate.blindUntil = 0;
         mate.kills = 0;
         mate.calloutAt = 0;
+        mate.smokeLeft = 1;
+        mate.targetSite = TEAM_DEFAULT_SITE[i];
+        mate.fakeSite = i === fakeIdx ? (mate.targetSite === 'A' ? 'B' : 'A') : null;
+        mate.fakeUntil = 0;
+        mate.plantSite = null;
+        const routeSite = mate.fakeSite || mate.targetSite;
+        mate.patrol = routeSite === 'B' ? TEAM_PATROLS_B[i] : TEAM_PATROLS_A[i];
+        mate.holdSpot = holdSpotFor(mate.targetSite, i);
         mate.group.rotation.set(0, mate.yaw, 0);
         mate.group.position.copy(mate.position);
         mate.torsoMat.emissiveIntensity = 0;

@@ -6,7 +6,7 @@ import { SHOP } from './weapons.js';
 const OVERLAY_COPY = {
   start: {
     title: 'SANDLINE',
-    copy: 'Yard 7, dusk. Four teammates at your back, five defenders holding Site A. Plant the charge or clear them out — first to 5 rounds takes the match.',
+    copy: 'Yard 7, dusk. Four teammates at your back, five defenders holding Sites A and B. Plant the charge at either site or clear them out — first to 5 rounds takes the match.',
     action: 'Click to deploy',
   },
   paused: {
@@ -45,6 +45,7 @@ export function createHud() {
   const crosshair = $('crosshair');
   const hitmarker = $('hitmarker');
   const vignette = $('vignette');
+  const dmgRing = $('dmg-ring');
   const flashOverlay = $('flash-overlay');
   const scopeOverlay = $('scope');
   const grenadeLine = $('grenades');
@@ -171,26 +172,36 @@ export function createHud() {
     clearCallouts() {
       callouts.innerHTML = '';
     },
-    // Top-down map of Yard 7: walls, Site A, you, the squad, the defenders.
+    // Top-down map of Yard 7: walls, both sites, you, the squad, the defenders.
     drawMinimap(data) {
       if (!mapCtx) return;
       const c = mapCtx;
       const W = minimap.width;
       const H = minimap.height;
-      const sx = W / 42.6;
-      const sy = H / 38.6;
-      const mx = (x) => (x + 21.3) * sx;
-      const my = (z) => (z + 19.3) * sy;
+      const b = data.bounds || { minX: -21.3, maxX: 21.3, minZ: -19.3, maxZ: 19.3 };
+      const sx = W / (b.maxX - b.minX);
+      const sy = H / (b.maxZ - b.minZ);
+      const mx = (x) => (x - b.minX) * sx;
+      const my = (z) => (z - b.minZ) * sy;
       c.clearRect(0, 0, W, H);
       c.fillStyle = 'rgba(25, 20, 16, 0.85)';
       c.fillRect(0, 0, W, H);
-      // Site A.
-      c.fillStyle = data.planted ? `rgba(255, 122, 26, ${0.35 + 0.2 * Math.sin(performance.now() / 180)})` : 'rgba(255, 122, 26, 0.25)';
-      c.fillRect(mx(-4), my(-18.2), 8 * sx, 7 * sy);
-      // Walls: outer ring, lane dividers, mid gate with its doorway.
+      // Both sites, with the planted one pulsing.
+      for (const s of data.sites || []) {
+        const planted = data.planted && data.plantedSite === s.label;
+        c.fillStyle = planted ? `rgba(255, 122, 26, ${0.35 + 0.2 * Math.sin(performance.now() / 180)})` : 'rgba(255, 122, 26, 0.25)';
+        c.fillRect(mx(s.x - s.hw), my(s.z - s.hd), s.hw * 2 * sx, s.hd * 2 * sy);
+        c.fillStyle = 'rgba(245, 234, 214, 0.85)';
+        c.font = 'bold 9px ui-monospace, monospace';
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillText(s.label, mx(s.x), my(s.z));
+      }
+      // Walls: outer ring, lane dividers, mid gate with its doorway, and the
+      // wing wall (x 21.3) with its three doorways.
       c.strokeStyle = 'rgba(245, 234, 214, 0.55)';
       c.lineWidth = 1;
-      c.strokeRect(mx(-21.3), my(-19.3), 42.6 * sx, 38.6 * sy);
+      c.strokeRect(mx(b.minX), my(b.minZ), (b.maxX - b.minX) * sx, (b.maxZ - b.minZ) * sy);
       c.beginPath();
       for (const side of [-7, 7]) {
         c.moveTo(mx(side), my(7));
@@ -202,6 +213,14 @@ export function createHud() {
       c.lineTo(mx(-1.3), my(0));
       c.moveTo(mx(1.3), my(0));
       c.lineTo(mx(7), my(0));
+      c.moveTo(mx(21.3), my(-19.3));
+      c.lineTo(mx(21.3), my(-17));
+      c.moveTo(mx(21.3), my(-13));
+      c.lineTo(mx(21.3), my(-9));
+      c.moveTo(mx(21.3), my(-5));
+      c.lineTo(mx(21.3), my(7));
+      c.moveTo(mx(21.3), my(11));
+      c.lineTo(mx(21.3), my(19.3));
       c.stroke();
       // Defenders: ember dots.
       for (const foe of data.foes) {
@@ -287,6 +306,14 @@ export function createHud() {
       vignette.classList.remove('hit');
       void vignette.offsetWidth;
       vignette.classList.add('hit');
+    },
+    // A chevron on a ring around the crosshair, rotated toward the shooter.
+    damageDirection(angle) {
+      if (!dmgRing) return;
+      dmgRing.style.setProperty('--rot', `${angle.toFixed(3)}rad`);
+      dmgRing.classList.remove('on');
+      void dmgRing.offsetWidth;
+      dmgRing.classList.add('on');
     },
     flashOverlay(strength) {
       flashOverlay.style.opacity = String(Math.min(1, strength));

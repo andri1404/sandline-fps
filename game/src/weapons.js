@@ -112,6 +112,7 @@ export function createWeapons(camera) {
   const ammo = {};
   for (const id of Object.keys(WEAPONS)) ammo[id] = { mag: WEAPONS[id].magSize, reserve: WEAPONS[id].reserveMax };
   const state = { primary: 'rifle', slot: 1, cooldown: 0, reloadLeft: 0, flash: 0, kick: 0, switchT: 0, scoped: false };
+  let bobT = 0;
   models.rifle.visible = true;
 
   function def() {
@@ -122,7 +123,7 @@ export function createWeapons(camera) {
     return models[def().id];
   }
 
-  function step(dt, aiming) {
+  function step(dt, aiming, speed = 0) {
     const d = def();
     state.cooldown = Math.max(0, state.cooldown - dt);
     state.flash = Math.max(0, state.flash - dt);
@@ -130,11 +131,21 @@ export function createWeapons(camera) {
     state.switchT = Math.max(0, state.switchT - dt);
     const model = currentModel();
     const baseZ = model.userData.baseZ ?? (model.userData.baseZ = model.position.z);
+    const baseX = model.userData.baseX ?? (model.userData.baseX = model.position.x);
+    const baseY = model.userData.baseY ?? (model.userData.baseY = model.position.y);
     model.position.z = baseZ + state.kick;
     model.rotation.x = state.kick * 2.2 + (state.switchT > 0 ? state.switchT * 1.4 : 0);
-    flash.visible = state.flash > 0;
+    state.scoped = aiming && d.id === 'sniper' && state.reloadLeft === 0;
+    // Scoped: the view model leaves the frame, the crosshair does the work.
+    model.visible = !state.scoped;
+    // Walk bob: a small sway that grows with speed and dies at a standstill.
+    bobT += dt * (1.5 + speed * 1.6);
+    const bob = state.scoped ? 0 : Math.min(1, speed / 5.2);
+    model.position.x = baseX + Math.sin(bobT) * 0.006 * bob;
+    model.position.y = baseY + Math.abs(Math.cos(bobT)) * 0.008 * bob;
+    flash.visible = state.flash > 0 && !state.scoped;
     flash.rotation.z = state.flash * 30;
-    flashLight.intensity = state.flash > 0 ? 18 : 0;
+    flashLight.intensity = state.flash > 0 && !state.scoped ? 18 : 0;
     state.scoped = aiming && d.id === 'sniper' && state.reloadLeft === 0;
     if (state.reloadLeft > 0) {
       state.reloadLeft = Math.max(0, state.reloadLeft - dt);

@@ -61,7 +61,7 @@ export function createAudio() {
 
   return {
     ensure,
-    shot(kind) {
+    shot(kind, gain = 1) {
       if (!ctx) return;
       if (kind === 'sniper') {
         noise(0.28, 900, 0.9);
@@ -73,8 +73,9 @@ export function createAudio() {
         noise(0.12, 1800, 0.6);
         tone(180, 0.08, 0.3, 'square', 90);
       } else if (kind === 'bot') {
-        noise(0.11, 1500, 0.28);
-        tone(160, 0.07, 0.14, 'square', 80);
+        // Distant shots sound distant: gain falls with range.
+        noise(0.11, 1500, 0.28 * gain);
+        tone(160, 0.07, 0.14 * gain, 'square', 80);
       } else {
         noise(0.14, 2000, 0.7);
         tone(170, 0.1, 0.35, 'sawtooth', 70);

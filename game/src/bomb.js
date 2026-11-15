@@ -1,15 +1,16 @@
-// The bomb: hold E inside Site A to plant, then a 40 second fuse. The bomb is a
+// The bomb: hold E inside a site to plant, then a 40 second fuse. The bomb is a
 // small box with a blinking ember light; its beeps quicken as the fuse runs down.
-// If the planter dies, a defender can defuse it in 5 seconds flat.
+// If the planter dies, a defender can defuse it in 5 seconds flat. The charge
+// lives at whichever site it was planted on — Site A or Site B.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
 export const PLANT_SECONDS = 3;
 export const FUSE_SECONDS = 40;
 
-export function createBomb(scene, site) {
+export function createBomb(scene, sites) {
   const group = new THREE.Group();
-  group.position.set(site.x, 0.35, site.z);
+  group.position.set(sites.A.x, 0.35, sites.A.z);
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(0.42, 0.28, 0.3),
     new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.surface), roughness: 0.5, metalness: 0.4 }),
@@ -23,7 +24,7 @@ export function createBomb(scene, site) {
   group.visible = false;
   scene.add(group);
 
-  const state = { status: 'idle', plantT: 0, fuse: FUSE_SECONDS, beepAt: 0, planter: null };
+  const state = { status: 'idle', plantT: 0, fuse: FUSE_SECONDS, beepAt: 0, planter: null, site: null };
   let beepCount = 0;
 
   return {
@@ -34,13 +35,15 @@ export function createBomb(scene, site) {
       state.plantT = 0;
       state.fuse = FUSE_SECONDS;
       state.planter = null;
+      state.site = null;
       beepCount = 0;
       group.visible = false;
     },
-    startPlant(planter = 'player') {
+    startPlant(planter = 'player', site = 'A') {
       if (state.status !== 'idle') return;
       state.status = 'planting';
       state.planter = planter;
+      state.site = site;
       state.plantT = 0;
     },
     cancelPlant() {
@@ -48,6 +51,7 @@ export function createBomb(scene, site) {
         state.status = 'idle';
         state.plantT = 0;
         state.planter = null;
+        state.site = null;
       }
     },
     progress() {
@@ -59,11 +63,14 @@ export function createBomb(scene, site) {
       state.fuse = FUSE_SECONDS;
       state.beepAt = 0;
       beepCount = 0;
+      const site = sites[state.site] || sites.A;
+      group.position.set(site.x, 0.35, site.z);
       group.visible = true;
     },
     defuse() {
       state.status = 'defused';
       state.planter = null;
+      state.site = null;
       group.visible = false;
     },
     step(dt, audio) {
