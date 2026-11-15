@@ -117,12 +117,37 @@ export function createWorld(scene) {
   barrel(10.8, -9.5);
 
   // Connector corners: a crate in each doorway so every crossing is a peek.
-  box(1.2, 1.2, 1.2, -7, 0.6, 5, 'hairline');
-  box(1.2, 1.2, 1.2, 7, 0.6, 5, 'hairline');
+  // They sit just south of the connector nodes — a crate on the node itself
+  // makes the waypoint unreachable, and the bots orbit it forever.
+  box(1.2, 1.2, 1.2, -7, 0.6, 3, 'hairline');
+  box(1.2, 1.2, 1.2, 7, 0.6, 3, 'hairline');
 
   // Spawn cover.
   box(1.2, 1.2, 1.2, -5, 0.6, 14, 'hairline');
   box(1.2, 1.2, 1.2, 5, 0.6, 14, 'hairline');
+
+  // Corner stacks and wall-side cover: height and depth at the map's edges,
+  // clear of every waypoint line so no patrol ever stalls on them.
+  function stack(x, z) {
+    box(1.2, 1.2, 1.2, x, 0.6, z, 'hairline');
+    box(1.2, 1.2, 1.2, x, 1.8, z, 'muted');
+  }
+  stack(-19, 17);
+  stack(19, 17);
+  stack(-19, -17);
+  stack(19, -17);
+  stack(-11.5, -17);
+  stack(11.5, -17);
+  box(1.2, 1.2, 1.2, -19, 0.6, 0, 'hairline');
+  box(1.2, 1.2, 1.2, 19, 0.6, 0, 'hairline');
+  box(2.4, 2.6, 5, -17, 1.3, -2, 'muted');
+  box(2.4, 2.6, 5, 17, 1.3, -2, 'muted');
+  box(1.2, 1.2, 1.2, -4, 0.6, 10, 'hairline');
+  box(1.2, 1.2, 1.2, 4, 0.6, 12, 'hairline');
+  barrel(-16, 14);
+  barrel(16, 14);
+  barrel(-1.5, 18.3);
+  barrel(1.5, 18.3);
 
   // Site A: two containers flanking the plant zone, crates, a jumpable perch,
   // and barrels at the mouth of the site.
@@ -148,10 +173,55 @@ export function createWorld(scene) {
   strip(8, 0.35, 0, -18.2);
   strip(0.35, 7, -4, -14.7);
   strip(0.35, 7, 4, -14.7);
-  const diamond = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.06, 1.4), mark);
-  diamond.position.set(0, 0.03, -14.7);
-  diamond.rotation.y = Math.PI / 4;
-  group.add(diamond);
+
+  // Site lettering, drawn once on canvas textures: a big ember "A" on the
+  // floor of the plant zone and a SITE A sign on the north wall, so the
+  // objective reads from across the yard.
+  function textTexture(draw, w, h) {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const c = canvas.getContext('2d');
+    draw(c, w, h);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.anisotropy = 4;
+    return tex;
+  }
+  const aTex = textTexture((c, w, h) => {
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = '#ff7a1a';
+    c.font = 'bold 190px system-ui, sans-serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.globalAlpha = 0.85;
+    c.fillText('A', w / 2, h / 2 + 8);
+  }, 256, 256);
+  const aDecal = new THREE.Mesh(new THREE.PlaneGeometry(4.5, 4.5), new THREE.MeshBasicMaterial({ map: aTex, transparent: true, depthWrite: false }));
+  aDecal.rotation.x = -Math.PI / 2;
+  aDecal.position.set(0, 0.05, -14.7);
+  group.add(aDecal);
+  const signTex = textTexture((c, w, h) => {
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = '#f5ead6';
+    c.font = 'bold 84px system-ui, sans-serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText('SITE  A', w / 2, h / 2);
+    c.fillStyle = '#ff7a1a';
+    c.fillRect(0, h - 10, w, 10);
+  }, 512, 128);
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(6, 1.5), new THREE.MeshBasicMaterial({ map: signTex, transparent: true }));
+  sign.position.set(0, 3.4, -18.9);
+  group.add(sign);
+
+  // A warm light shaft over the site, so the objective glows at dusk.
+  const shaftMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  for (const rot of [0, Math.PI / 2]) {
+    const shaft = new THREE.Mesh(new THREE.PlaneGeometry(0.7, 7), shaftMat);
+    shaft.position.set(0, 3.5, -14.7);
+    shaft.rotation.y = rot;
+    group.add(shaft);
+  }
 
   // A pole lamp over the site, ember light spilling onto the plant zone.
   const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 4.4, 8), materials.hairline);
@@ -165,8 +235,8 @@ export function createWorld(scene) {
   // Bright enough that every lane reads at a glance in a screenshot.
   const sky = new THREE.HemisphereLight(new THREE.Color(PALETTE.ink), new THREE.Color(PALETTE.canvas), 1.35);
   scene.add(sky);
-  const sun = new THREE.DirectionalLight(new THREE.Color('#ffd9a0'), 2.7);
-  sun.position.set(18, 20, 12);
+  const sun = new THREE.DirectionalLight(new THREE.Color('#ffbe78'), 3.1);
+  sun.position.set(24, 13, 10);
   sun.target.position.set(0, 0, -4);
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
@@ -202,6 +272,12 @@ export function createWorld(scene) {
     group,
     waypoints: WAYPOINTS,
     playerSpawn: { x: 0, z: 15, yaw: 0 },
+    attackerSpawns: [
+      { x: -1.5, z: 15 },
+      { x: 1.5, z: 15 },
+      { x: -3, z: 14 },
+      { x: 3, z: 14 },
+    ],
     defenderSpawns: [
       { x: -14, z: -16 },
       { x: 14, z: -16 },

@@ -119,6 +119,10 @@ export function createAudio() {
       tone(880, 0.06, 0.25, 'sine');
       setTimeout(() => tone(1174, 0.1, 0.25, 'sine'), 70);
     },
+    radio() {
+      tone(1250, 0.04, 0.12, 'square');
+      setTimeout(() => tone(1250, 0.04, 0.1, 'square'), 90);
+    },
     flashPop() {
       noise(0.3, 4000, 0.7, 'highpass');
       tone(2000, 0.2, 0.2, 'sine', 300);

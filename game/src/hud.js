@@ -6,7 +6,7 @@ import { SHOP } from './weapons.js';
 const OVERLAY_COPY = {
   start: {
     title: 'SANDLINE',
-    copy: 'Yard 7, dusk. Five defenders hold Site A. Plant the charge or clear them out — first to 5 rounds takes the match.',
+    copy: 'Yard 7, dusk. Four teammates at your back, five defenders holding Site A. Plant the charge or clear them out — first to 5 rounds takes the match.',
     action: 'Click to deploy',
   },
   paused: {
@@ -50,6 +50,11 @@ export function createHud() {
   const grenadeLine = $('grenades');
   const slotPrimary = $('slot-primary');
   const slotSide = $('slot-side');
+  const squadList = $('squad-list');
+  const defPips = $('def-pips');
+  const callouts = $('callouts');
+  const minimap = $('minimap');
+  const mapCtx = minimap ? minimap.getContext('2d') : null;
   let hitTimer = 0;
   let bannerTimer = 0;
   let lastAmmo = '';
@@ -57,6 +62,7 @@ export function createHud() {
   let lastTimer = '';
   let lastMoney = -1;
   let lastScore = '';
+  let lastSquad = '';
   let buyHandler = null;
 
   function renderBuy(money, owned) {
@@ -134,6 +140,97 @@ export function createHud() {
         line.classList.add('fade');
         setTimeout(() => line.remove(), 600);
       }, 4200);
+    },
+    // Squad list: you and the four teammates, alive or down, with health.
+    // Rebuilds only when the signature changes, so a steady frame costs nothing.
+    setSquad(list, defAlive) {
+      const key = list.map((m) => `${m.name}:${m.alive ? Math.ceil(m.hp / 5) * 5 : 'x'}`).join('|') + `|d${defAlive}`;
+      if (key === lastSquad) return;
+      lastSquad = key;
+      let html = '';
+      for (const m of list) {
+        const hp = Math.max(0, Math.ceil(m.hp));
+        html += `<div class="squad-row${m.alive ? '' : ' down'}${m.you ? ' you' : ''}"><span class="squad-name">${m.you ? 'YOU' : m.name}</span><span class="squad-bar"><i style="width:${hp}%"></i></span><span class="squad-hp">${m.alive ? hp : 'DOWN'}</span></div>`;
+      }
+      squadList.innerHTML = html;
+      let pips = '';
+      for (let i = 0; i < 5; i += 1) pips += i < defAlive ? '●' : '○';
+      defPips.textContent = `DEF ${pips}`;
+    },
+    callout(text) {
+      const line = document.createElement('div');
+      line.className = 'callout-line';
+      line.textContent = text;
+      callouts.prepend(line);
+      while (callouts.children.length > 3) callouts.removeChild(callouts.lastChild);
+      setTimeout(() => {
+        line.classList.add('fade');
+        setTimeout(() => line.remove(), 600);
+      }, 4500);
+    },
+    clearCallouts() {
+      callouts.innerHTML = '';
+    },
+    // Top-down map of Yard 7: walls, Site A, you, the squad, the defenders.
+    drawMinimap(data) {
+      if (!mapCtx) return;
+      const c = mapCtx;
+      const W = minimap.width;
+      const H = minimap.height;
+      const sx = W / 42.6;
+      const sy = H / 38.6;
+      const mx = (x) => (x + 21.3) * sx;
+      const my = (z) => (z + 19.3) * sy;
+      c.clearRect(0, 0, W, H);
+      c.fillStyle = 'rgba(25, 20, 16, 0.85)';
+      c.fillRect(0, 0, W, H);
+      // Site A.
+      c.fillStyle = data.planted ? `rgba(255, 122, 26, ${0.35 + 0.2 * Math.sin(performance.now() / 180)})` : 'rgba(255, 122, 26, 0.25)';
+      c.fillRect(mx(-4), my(-18.2), 8 * sx, 7 * sy);
+      // Walls: outer ring, lane dividers, mid gate with its doorway.
+      c.strokeStyle = 'rgba(245, 234, 214, 0.55)';
+      c.lineWidth = 1;
+      c.strokeRect(mx(-21.3), my(-19.3), 42.6 * sx, 38.6 * sy);
+      c.beginPath();
+      for (const side of [-7, 7]) {
+        c.moveTo(mx(side), my(7));
+        c.lineTo(mx(side), my(12));
+        c.moveTo(mx(side), my(-6));
+        c.lineTo(mx(side), my(3));
+      }
+      c.moveTo(mx(-7), my(0));
+      c.lineTo(mx(-1.3), my(0));
+      c.moveTo(mx(1.3), my(0));
+      c.lineTo(mx(7), my(0));
+      c.stroke();
+      // Defenders: ember dots.
+      for (const foe of data.foes) {
+        if (!foe.alive) continue;
+        c.fillStyle = '#ff7a1a';
+        c.beginPath();
+        c.arc(mx(foe.x), my(foe.z), 3, 0, Math.PI * 2);
+        c.fill();
+      }
+      // Teammates: warm white dots.
+      for (const mate of data.mates) {
+        if (!mate.alive) continue;
+        c.fillStyle = '#f5ead6';
+        c.beginPath();
+        c.arc(mx(mate.x), my(mate.z), 3, 0, Math.PI * 2);
+        c.fill();
+      }
+      // You: a triangle pointing where you look.
+      c.save();
+      c.translate(mx(data.px), my(data.pz));
+      c.rotate(-data.yaw);
+      c.fillStyle = '#ffffff';
+      c.beginPath();
+      c.moveTo(0, -6);
+      c.lineTo(4.5, 5);
+      c.lineTo(-4.5, 5);
+      c.closePath();
+      c.fill();
+      c.restore();
     },
     setBomb(text) {
       bombStatus.textContent = text;

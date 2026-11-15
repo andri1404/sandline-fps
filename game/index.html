@@ -162,6 +162,31 @@
     color: var(--ink);
     text-shadow: 0 2px 8px rgba(0, 0, 0, .6);
   }
+  #minimap-wrap { position: fixed; left: 32px; top: 20px; width: 150px; }
+  #minimap { display: block; border: 1px solid var(--hairline); border-radius: var(--radius-panel); background: rgba(25, 20, 16, .85); }
+  #squad { margin-top: 6px; font-family: var(--font-readout); font-size: 11px; letter-spacing: .06em; }
+  #def-pips { color: var(--accent); margin-bottom: 4px; letter-spacing: .1em; text-shadow: 0 2px 6px rgba(0, 0, 0, .7); }
+  .squad-row { display: flex; align-items: center; gap: 6px; color: var(--ink); text-shadow: 0 2px 6px rgba(0, 0, 0, .7); margin-bottom: 2px; }
+  .squad-row.you .squad-name { color: var(--accent); }
+  .squad-row.down { opacity: .45; }
+  .squad-name { width: 44px; }
+  .squad-bar { flex: 1; height: 5px; background: rgba(25, 20, 16, .6); border: 1px solid var(--hairline); border-radius: 2px; overflow: hidden; }
+  .squad-bar i { display: block; height: 100%; background: var(--ink); }
+  .squad-row.down .squad-bar i { background: var(--accent); }
+  .squad-hp { width: 30px; text-align: right; color: var(--muted); }
+  #callouts {
+    position: fixed;
+    right: 32px;
+    top: 208px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-end;
+    font-family: var(--font-readout);
+    font-size: 13px;
+  }
+  .callout-line { background: rgba(42, 33, 24, .8); border: 1px solid var(--hairline); border-left: 3px solid var(--accent); border-radius: var(--radius-panel); padding: 4px 8px; color: var(--ink); transition: opacity 600ms linear; }
+  .callout-line.fade { opacity: 0; }
   #killfeed {
     position: fixed;
     right: 32px;
@@ -339,6 +364,11 @@
   <div id="bomb-status" hidden></div>
   <div id="plant-wrap" hidden><div id="plant-label">PLANTING THE CHARGE</div><div id="plant-bar"><div id="plant-fill"></div></div></div>
   <div id="money"><span id="money-value">$800</span></div>
+  <div id="minimap-wrap">
+    <canvas id="minimap" width="150" height="136"></canvas>
+    <div id="squad"><div id="def-pips"></div><div id="squad-list"></div></div>
+  </div>
+  <div id="callouts"></div>
   <div id="killfeed"></div>
   <div id="banner" hidden><div id="banner-title"></div><div id="banner-sub"></div></div>
   <div id="buy" hidden>

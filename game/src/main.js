@@ -8,7 +8,7 @@ import { createWorld } from './world.js';
 import { createInput } from './input.js';
 import { createPlayer } from './player.js';
 import { createWeapons, WEAPONS, SHOP } from './weapons.js';
-import { createBots } from './bots.js';
+import { createBots, createTeammates } from './bots.js';
 import { createEconomy, REWARDS } from './economy.js';
 import { createBomb, FUSE_SECONDS } from './bomb.js';
 import { createGrenades } from './grenades.js';
@@ -44,12 +44,13 @@ document.getElementById('game').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 26, 62);
+scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 20, 52);
 const camera = new THREE.PerspectiveCamera(BASE_FOV, window.innerWidth / window.innerHeight, 0.05, 160);
 scene.add(camera);
 
 const world = createWorld(scene);
 const bots = createBots(scene, world, random);
+const mates = createTeammates(scene, world, random);
 const weapons = createWeapons(camera);
 const hud = createHud();
 const player = createPlayer(world.collides);
@@ -66,6 +67,96 @@ const shootables = world.shootables.concat(bots.hitMeshes);
 const direction = new THREE.Vector3();
 const camPos = new THREE.Vector3();
 
+// Bullet tracers: a small pool of pre-allocated lines, reused for every shot
+// the player or any agent fires. Impact sparks: one Points cloud with fixed
+// buffers, a handful of particles woken per hit. Nothing here allocates in
+// the hot path; both fade out in frame().
+const TRACER_COUNT = 12;
+const tracers = [];
+for (let i = 0; i < TRACER_COUNT; i += 1) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const mat = new THREE.LineBasicMaterial({ color: 0xffc27a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
+  const line = new THREE.Line(geo, mat);
+  line.visible = false;
+  line.frustumCulled = false;
+  scene.add(line);
+  tracers.push({ line, geo, mat, life: 0 });
+}
+let tracerIdx = 0;
+function spawnTracer(from, dir, length) {
+  const t = tracers[tracerIdx];
+  tracerIdx = (tracerIdx + 1) % TRACER_COUNT;
+  const pos = t.geo.attributes.position.array;
+  pos[0] = from.x;
+  pos[1] = from.y;
+  pos[2] = from.z;
+  pos[3] = from.x + dir.x * length;
+  pos[4] = from.y + dir.y * length;
+  pos[5] = from.z + dir.z * length;
+  t.geo.attributes.position.needsUpdate = true;
+  t.life = 0.08;
+  t.mat.opacity = 0.9;
+  t.line.visible = true;
+}
+function updateTracers(dt) {
+  for (const t of tracers) {
+    if (t.life <= 0) continue;
+    t.life -= dt;
+    if (t.life <= 0) {
+      t.line.visible = false;
+      t.mat.opacity = 0;
+    } else {
+      t.mat.opacity = (t.life / 0.08) * 0.9;
+    }
+  }
+}
+
+const IMPACT_MAX = 60;
+const impactGeo = new THREE.BufferGeometry();
+const impactPos = new Float32Array(IMPACT_MAX * 3);
+const impactVel = new Float32Array(IMPACT_MAX * 3);
+const impactLife = new Float32Array(IMPACT_MAX);
+for (let i = 0; i < IMPACT_MAX; i += 1) impactPos[i * 3 + 1] = -50;
+impactGeo.setAttribute('position', new THREE.BufferAttribute(impactPos, 3));
+const impactPts = new THREE.Points(impactGeo, new THREE.PointsMaterial({ color: 0xffb066, size: 0.09, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true }));
+impactPts.frustumCulled = false;
+scene.add(impactPts);
+let impactIdx = 0;
+function spawnImpact(point, count = 6) {
+  for (let n = 0; n < count; n += 1) {
+    const i = impactIdx;
+    impactIdx = (impactIdx + 1) % IMPACT_MAX;
+    impactPos[i * 3] = point.x;
+    impactPos[i * 3 + 1] = point.y;
+    impactPos[i * 3 + 2] = point.z;
+    const a = random() * Math.PI * 2;
+    const sp = 2 + random() * 3;
+    impactVel[i * 3] = Math.cos(a) * sp;
+    impactVel[i * 3 + 1] = 1 + random() * 3;
+    impactVel[i * 3 + 2] = Math.sin(a) * sp;
+    impactLife[i] = 0.35 + random() * 0.25;
+  }
+  impactGeo.attributes.position.needsUpdate = true;
+}
+function updateImpacts(dt) {
+  let any = false;
+  for (let i = 0; i < IMPACT_MAX; i += 1) {
+    if (impactLife[i] <= 0) continue;
+    any = true;
+    impactLife[i] -= dt;
+    if (impactLife[i] <= 0) {
+      impactPos[i * 3 + 1] = -50;
+      continue;
+    }
+    impactVel[i * 3 + 1] -= 9 * dt;
+    impactPos[i * 3] += impactVel[i * 3] * dt;
+    impactPos[i * 3 + 1] += impactVel[i * 3 + 1] * dt;
+    impactPos[i * 3 + 2] += impactVel[i * 3 + 2] * dt;
+  }
+  if (any) impactGeo.attributes.position.needsUpdate = true;
+}
+
 // The one game state: health, match, and the wires between modules.
 const game = {
   health: 100,
@@ -76,6 +167,7 @@ const game = {
   elapsed: 0,
   stepAcc: 0,
   prevFiring: false,
+  prevBomb: 'idle',
   menuT: 0,
 };
 
@@ -113,12 +205,23 @@ function botContext() {
     playerHeight: body.height,
     playerSpeed: player.groundSpeed(),
     playerAlive: game.alive,
+    // Every attacker a defender can shoot: the player, then the teammates.
+    attackers: [
+      { kind: 'player', ref: null, x: body.position.x, y: body.position.y, z: body.position.z, eye: body.eye, height: body.height, speed: player.groundSpeed(), alive: game.alive },
+      ...mates.mates.map((m) => ({ kind: 'mate', ref: m, x: m.position.x, y: 0, z: m.position.z, eye: 1.55, height: 1.72, speed: 0, alive: m.alive })),
+    ],
     noise: game.noise,
     smokeBlocks: (ax, ay, az, bx, by, bz) => grenades.blocksLOS(ax, ay, az, bx, by, bz),
     bombPlanted: bomb.state.status === 'planted',
     bomb: { x: world.site.x, z: world.site.z },
-    onBotShot: () => audio.shot('bot'),
+    onAgentShot: (agent, origin, dir) => {
+      audio.shot('bot');
+      spawnTracer(origin, dir, 40);
+    },
+    onKillFeed: (text) => hud.killfeed(text),
     onPlayerHit: (damage, isHead, bot) => damagePlayer(damage, isHead, bot),
+    onDefenderDown: () => checkCombatEnd(),
+    onMateDown: () => checkCombatEnd(),
     onDefused: () => {
       bomb.defuse();
       endRound(false, 'The bomb was defused.');
@@ -126,9 +229,70 @@ function botContext() {
   };
 }
 
+function mateContext() {
+  return {
+    defenders: bots.bots,
+    noise: game.noise,
+    smokeBlocks: (ax, ay, az, bx, by, bz) => grenades.blocksLOS(ax, ay, az, bx, by, bz),
+    bombPlanted: bomb.state.status === 'planted',
+    bombIdle: bomb.state.status === 'idle',
+    bombStatus: bomb.state.status,
+    // Live read: the snapshot fields above are taken when the context is
+    // built, before thinkMate runs — a plant started this step still reads
+    // as 'idle' through them.
+    bombLive: () => bomb.state.status,
+    bomb: { x: world.site.x, z: world.site.z },
+    inSite: (x, z) => world.inSite(x, z),
+    onAgentShot: (agent, origin, dir) => {
+      audio.shot('bot');
+      spawnTracer(origin, dir, 40);
+    },
+    onKillFeed: (text) => hud.killfeed(text),
+    onDefenderDown: () => checkCombatEnd(),
+    onMateStartPlant: (mate) => {
+      if (bomb.state.status === 'idle') bomb.startPlant(mate);
+    },
+    onMateCancelPlant: (mate) => {
+      if (bomb.state.status === 'planting' && bomb.state.planter === mate) bomb.cancelPlant();
+    },
+    onCallout: (text) => {
+      hud.callout(text);
+      audio.radio();
+    },
+  };
+}
+
+function squadList() {
+  const list = [{ name: 'YOU', hp: game.health, alive: game.alive, you: true }];
+  for (const m of mates.mates) list.push({ name: m.name, hp: m.health, alive: m.alive, you: false });
+  return list;
+}
+
+// The round can end on any kill: all defenders down wins it, a wiped squad
+// loses it. A planted bomb decides the round by itself, so it is left alone.
+function checkCombatEnd() {
+  const phase = rounds.state.phase;
+  if (phase !== 'live' && phase !== 'aftermath') return;
+  if (bots.aliveCount() === 0 && bomb.state.status !== 'planted' && phase === 'live') {
+    endRound(true, 'All defenders down.');
+    return;
+  }
+  if (!game.alive && mates.aliveCount() === 0 && bomb.state.status !== 'planted' && phase === 'live') {
+    endRound(false, 'Squad wiped.');
+  }
+}
+
+function mvpLine() {
+  const entries = [{ name: 'YOU', kills: game.kills }];
+  for (const m of mates.mates) entries.push({ name: m.name, kills: m.kills });
+  entries.sort((a, b) => b.kills - a.kills);
+  const top = entries[0];
+  return top.kills > 0 ? `MVP: ${top.name} — ${top.kills} kill${top.kills === 1 ? '' : 's'}.` : 'No kills yet this round.';
+}
+
 function grenadeContext() {
   return {
-    bots: bots.bots,
+    bots: bots.bots.concat(mates.mates),
     playerAlive: game.alive,
     playerPos: body.position,
     playerEye: body.eye,
@@ -154,6 +318,9 @@ function damagePlayer(damage, isHead, bot) {
     if (bomb.state.status === 'planted') {
       rounds.state.phase = 'aftermath';
       hud.banner('YOU ARE DOWN', 'The bomb is still ticking — can they defuse it in time?');
+    } else if (mates.aliveCount() > 0) {
+      // The round goes on without you: the squad can still take it.
+      hud.banner('YOU ARE DOWN', 'Your squad is still fighting — they can still take the round.');
     } else {
       endRound(false, 'You were eliminated.');
     }
@@ -173,6 +340,8 @@ function shoot(spread) {
   scene.updateMatrixWorld(true);
   raycaster.set(camera.position, direction);
   const hit = raycaster.intersectObjects(shootables, false)[0];
+  const tracerLen = hit ? camera.position.distanceTo(hit.point) : 60;
+  spawnTracer(camera.position, direction, tracerLen);
   if (hit && hit.object.userData.bot) {
     const isHead = hit.object.userData.part === 'head';
     const killed = bots.damage(hit.object, isHead ? weapons.headDamage() : weapons.damage());
@@ -184,9 +353,9 @@ function shoot(spread) {
     }
     hud.hitMarker(killed, markerHoldMs);
     audio.hit(killed);
-    if (bots.aliveCount() === 0 && bomb.state.status !== 'planted' && rounds.state.phase === 'live') {
-      endRound(true, 'All defenders down.');
-    }
+    checkCombatEnd();
+  } else if (hit) {
+    spawnImpact(hit.point, 6);
   }
   weapons.pullTrigger();
   player.recoil(weapons.def().kick * (0.9 + random() * 0.25), (random() * 2 - 1) * 0.004);
@@ -219,13 +388,16 @@ function buyItem(id) {
 function resetRound() {
   player.reset(world.playerSpawn.x, world.playerSpawn.z, world.playerSpawn.yaw);
   bots.reset(world.defenderSpawns);
+  mates.reset(world.attackerSpawns);
   weapons.refillAll();
   bomb.reset();
   grenades.reset();
   game.health = 100;
   game.alive = true;
+  game.kills = 0;
   game.noise = [];
   game.grenade = 'flash';
+  game.prevBomb = 'idle';
   hud.setHealth(100, economy.state.armor);
   hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
   hud.setSlots(weapons.def().name, weapons.state.slot);
@@ -233,6 +405,8 @@ function resetRound() {
   hud.setBomb('');
   hud.setPlant(null);
   hud.hideBanner();
+  hud.clearCallouts();
+  hud.setSquad(squadList(), bots.aliveCount());
   syncCamera();
 }
 
@@ -273,7 +447,7 @@ function endRound(won, reason) {
     hud.banner(matchWon ? 'MATCH WON' : 'MATCH LOST', `${rounds.state.wins} — ${rounds.state.losses} · ${reason}`, 4000);
     hud.showOverlay('matchEnd', {
       title: matchWon ? 'Match won' : 'Match lost',
-      copy: `Final score ${rounds.state.wins} — ${rounds.state.losses}. ${reason}`,
+      copy: `Final score ${rounds.state.wins} — ${rounds.state.losses}. ${reason} ${mvpLine()}`,
       action: 'Play again',
     });
     if (document.pointerLockElement) document.exitPointerLock();
@@ -281,7 +455,7 @@ function endRound(won, reason) {
     hud.banner(won ? 'ROUND WON' : 'ROUND LOST', reason, 3200);
     hud.showOverlay('roundEnd', {
       title: won ? 'Round won' : 'Round lost',
-      copy: `${reason} Score ${rounds.state.wins} — ${rounds.state.losses}.`,
+      copy: `${reason} Score ${rounds.state.wins} — ${rounds.state.losses}. ${mvpLine()}`,
       action: 'Next round',
     });
     if (document.pointerLockElement) document.exitPointerLock();
@@ -296,7 +470,8 @@ function onLockChange(locked) {
   if (locked) {
     hud.hideOverlay();
     overlayMode = 'playing';
-  } else if (rounds.state.phase === 'live') {
+  } else if (rounds.state.phase === 'live' && game.alive) {
+    // A dead player watches the squad finish the round; never pause on them.
     overlayMode = 'paused';
     hud.showOverlay('paused');
   }
@@ -367,19 +542,24 @@ function step(dt) {
           hud.setGrenades(economy.state.flash, economy.state.smoke, game.grenade);
         }
       }
-      // Plant: hold E inside Site A.
+      // Plant: hold E inside Site A. Only the player's own plant is
+      // cancelled here — a teammate planting must not be cut off by the
+      // player simply not holding E.
       const inSite = world.inSite(body.position.x, body.position.z);
       if (input.state.keys.has('KeyE') && inSite && bomb.state.status === 'idle') bomb.startPlant();
-      if (bomb.state.status === 'planting') {
+      if (bomb.state.status === 'planting' && bomb.state.planter === 'player') {
         if (!input.state.keys.has('KeyE') || !inSite || !game.alive) bomb.cancelPlant();
       }
     }
   }
 
   weapons.step(dt, input.state.aiming && game.alive);
-  // Bots freeze during the buy phase; they only play once the round is live.
+  // Bots and teammates freeze during the buy phase; they only play once the
+  // round is live.
   if (phase === 'live' || phase === 'aftermath') bots.step(dt, game.elapsed, botContext());
+  if (phase === 'live' || phase === 'aftermath') mates.step(dt, game.elapsed, mateContext());
   grenades.step(dt, game.elapsed, grenadeContext());
+  const wasPlanting = bomb.state.status === 'planting' ? bomb.state.planter : null;
   const bombEvent = bomb.step(dt, audio);
   if (bombEvent === 'detonated') {
     audio.explosion();
@@ -387,6 +567,12 @@ function step(dt) {
       endRound(true, 'The charge blew Site A.');
     }
   }
+  if (bomb.state.status === 'planted' && game.prevBomb === 'planting') {
+    economy.add(REWARDS.plant);
+    hud.setMoney(economy.state.money);
+    hud.killfeed(wasPlanting && wasPlanting !== 'player' ? `${wasPlanting.name} planted the charge` : 'You planted the charge');
+  }
+  game.prevBomb = bomb.state.status;
 
   // Bomb HUD.
   if (bomb.state.status === 'planted') {
@@ -438,6 +624,17 @@ function frame(now) {
     hud.crosshairGap(weapons.isScoped() ? 0 : 7 + weapons.spread(player.groundSpeed(), player.state.onGround) * 700);
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSlots(weapons.def().name, weapons.state.slot);
+    hud.setSquad(squadList(), bots.aliveCount());
+    hud.drawMinimap({
+      px: body.position.x,
+      pz: body.position.z,
+      yaw: body.yaw,
+      mates: mates.mates,
+      foes: bots.bots,
+      planted: bomb.state.status === 'planted',
+    });
+    updateTracers(dt);
+    updateImpacts(dt);
     if (phase === 'buy') hud.setTimer(rounds.state.freeze, 'buy');
     else if (bomb.state.status === 'planted') hud.setTimer(bomb.state.fuse, 'aftermath');
     else if (phase === 'live') hud.setTimer(rounds.state.timer, 'live');
@@ -474,10 +671,23 @@ function runShot(name) {
   if (name === 'start') {
     player.reset(world.playerSpawn.x, world.playerSpawn.z, 0.12);
     body.pitch = -0.01;
+    // Two teammates flanking the spawn, facing the camera: a squad at rest.
+    const viper = mates.mates[0];
+    viper.position.set(-2.5, 0, 11);
+    viper.yaw = Math.PI;
+    viper.group.position.copy(viper.position);
+    viper.group.rotation.y = viper.yaw;
+    const jinx = mates.mates[1];
+    jinx.position.set(2.5, 0, 11);
+    jinx.yaw = Math.PI;
+    jinx.group.position.copy(jinx.position);
+    jinx.group.rotation.y = jinx.yaw;
     settle(30);
     syncCamera();
     hud.showOverlay('start');
     hud.setTimer(100, 'live');
+    hud.setSquad(squadList(), bots.aliveCount());
+    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
   } else if (name === 'play') {
     rounds.startMatch();
     rounds.state.phase = 'live';
@@ -491,10 +701,32 @@ function runShot(name) {
     bot.state = 'engage';
     bot.group.position.copy(bot.position);
     bot.group.rotation.y = bot.yaw;
+    // Two teammates in the frame, firing through the mid doorway at the same
+    // defender: a 5v5 firefight, not a duel. A short settle keeps the burst
+    // to one shot each, so nobody drops before the frame is taken.
+    const viper = mates.mates[0];
+    viper.position.set(-1.5, 0, 0.2);
+    viper.yaw = 0;
+    viper.state = 'engage';
+    viper.target = bots.bots[2];
+    viper.reactionAt = 0;
+    viper.burstLeft = 0;
+    viper.group.position.copy(viper.position);
+    viper.group.rotation.y = viper.yaw;
+    const jinx = mates.mates[1];
+    jinx.position.set(1.2, 0, 1.2);
+    jinx.yaw = 0;
+    jinx.state = 'engage';
+    jinx.target = bots.bots[2];
+    jinx.reactionAt = 0;
+    jinx.burstLeft = 0;
+    jinx.group.position.copy(jinx.position);
+    jinx.group.rotation.y = jinx.yaw;
     economy.add(3050);
     hud.setMoney(economy.state.money);
     hud.setScore(1, 0, 2);
-    settle(24);
+    hud.callout('VIPER: Contact mid!');
+    settle(12);
     aimAt(bots.aimPoint(2));
     shoot(0);
     settle(2);
@@ -504,6 +736,8 @@ function runShot(name) {
     hud.setHealth(100, false);
     hud.setTimer(83, 'live');
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
+    hud.setSquad(squadList(), bots.aliveCount());
+    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
   } else if (name === 'buy') {
     rounds.startMatch();
     economy.add(3050);
@@ -513,6 +747,16 @@ function runShot(name) {
     hud.setMoney(economy.state.money);
     hud.setHealth(100, true);
     player.reset(0, 15, 0);
+    const viper = mates.mates[0];
+    viper.position.set(-3, 0, 10);
+    viper.yaw = Math.PI;
+    viper.group.position.copy(viper.position);
+    viper.group.rotation.y = viper.yaw;
+    const jinx = mates.mates[1];
+    jinx.position.set(-1, 0, 11);
+    jinx.yaw = Math.PI;
+    jinx.group.position.copy(jinx.position);
+    jinx.group.rotation.y = jinx.yaw;
     settle(20);
     hud.showBuy(economy.state.money, { armor: true, flash: 1, smoke: 0, primary: 'smg' });
     hud.setGrenades(1, 0, 'flash');
@@ -520,6 +764,8 @@ function runShot(name) {
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSlots(weapons.def().name, 1);
     hud.setScore(1, 0, 2);
+    hud.setSquad(squadList(), bots.aliveCount());
+    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
     syncCamera();
   } else {
     // end: round won at the site, all five defenders down.
@@ -535,6 +781,18 @@ function runShot(name) {
       bot.group.rotation.x = -1.5;
       bot.group.position.copy(bot.position);
     });
+    // The squad holds the site they just took: four teammates alive, and
+    // VIPER takes the MVP for the round.
+    const mateSpots = [[-2, -13], [2, -13], [-2, -16], [2, -16]];
+    mates.mates.forEach((mate, i) => {
+      mate.position.set(mateSpots[i][0], 0, mateSpots[i][1]);
+      mate.yaw = Math.PI;
+      mate.group.position.copy(mate.position);
+      mate.group.rotation.y = mate.yaw;
+    });
+    mates.mates[0].kills = 2;
+    mates.mates[1].kills = 1;
+    game.kills = 1;
     player.reset(-1.5, -8.5, 0.1);
     body.pitch = -0.02;
     settle(20);
@@ -544,7 +802,9 @@ function runShot(name) {
     hud.setHealth(100, false);
     hud.setAmmo(weapons.mag(), weapons.reserve(), weapons.def().name);
     hud.setSlots('VK-47', 1);
-    hud.showOverlay('roundEnd', { title: 'Round won', copy: 'All defenders down. Score 2 — 1.', action: 'Next round' });
+    hud.setSquad(squadList(), bots.aliveCount());
+    hud.drawMinimap({ px: body.position.x, pz: body.position.z, yaw: body.yaw, mates: mates.mates, foes: bots.bots, planted: false });
+    hud.showOverlay('roundEnd', { title: 'Round won', copy: `All defenders down. Score 2 — 1. ${mvpLine()}`, action: 'Next round' });
   }
   paintTwiceThenReady();
 }
@@ -560,5 +820,9 @@ syncCamera();
 hud.setScore(0, 0, 1);
 hud.setMoney(800);
 hud.showOverlay('start');
+if (params.get('debug')) {
+  // Headless verification hook: exposes the live sim when ?debug=1 is set.
+  window.__sandline = { game, rounds, bots, mates, bomb, world, player: body, hud };
+}
 if (shot) runShot(shot);
 else requestAnimationFrame(frame);

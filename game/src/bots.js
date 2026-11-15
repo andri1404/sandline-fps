@@ -1,7 +1,10 @@
-// The defenders: five bots that hold Site A and the lanes. Each one has a job,
-// a patrol, eyes and ears. They walk waypoint routes, hold angles, react to what
-// they see and hear, shoot back in bursts, and converge on the bomb to defuse it.
-// One job per function; the sim never allocates in its hot loops.
+// The fighters: five defenders holding Site A, and four teammates fighting
+// beside the player — a real 5v5. One agent system serves both sides: each
+// agent has a job, a patrol, eyes and ears. Agents walk waypoint routes, hold
+// angles, react to what they see and hear, shoot back in bursts, and the
+// defenders converge on a planted bomb to defuse it while a teammate that
+// reaches Site A plants the charge. One job per function; the sim never
+// allocates in its hot loops.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
@@ -20,6 +23,7 @@ const SHOT_GAP = 0.13;
 const DAMAGE = 20;
 const HEAD_MULT = 2.5;
 const DEFUSE_SECONDS = 5;
+const PLANT_SECONDS = 3;
 const FALL_SECONDS = 0.45;
 
 const ROLES = ['site', 'site', 'mid', 'west', 'east'];
@@ -36,6 +40,21 @@ const PATROLS = [
   [[0, -8], [0, 2], [0, -8], [0, 4]],
   [[-13, 8], [-13, -7], [-13, 3]],
   [[13, 8], [13, -7], [13, 3]],
+];
+
+const TEAM_NAMES = ['VIPER', 'JINX', 'ORYX', 'NOVA'];
+const TEAM_TORSO = ['ink', 'muted', 'surface', 'hairline'];
+const TEAM_PATROLS = [
+  [[0, 15], [0, 8], [0, 0], [0, -8], [0, -14]], // VIPER: mid
+  [[-2, 15], [-8, 14], [-13, 9], [-13, 3], [-13, -7], [-7, -8], [0, -14]], // JINX: west
+  [[2, 15], [8, 14], [13, 9], [13, 3], [13, -7], [7, -8], [0, -14]], // ORYX: east
+  [[1, 15], [7, 5], [0, 0], [0, -8], [0, -14]], // NOVA: mid support
+];
+const TEAM_HOLD = [
+  [-2, -13],
+  [2, -13],
+  [-2, -16],
+  [2, -16],
 ];
 
 function nearestNode(waypoints, x, z) {
@@ -78,11 +97,40 @@ function findPath(waypoints, from, to) {
   return [to];
 }
 
+// Slab test: distance along the ray to a box, or null. The caller reuses its
+// two box vectors; this function allocates nothing.
+const boxMaxTmp = new THREE.Vector3();
+const boxMinTmp = new THREE.Vector3();
+function rayHitsBox(origin, dir, min, max) {
+  boxMaxTmp.copy(max);
+  let tmin = 0;
+  let tmax = Infinity;
+  const axes = ['x', 'y', 'z'];
+  for (let i = 0; i < 3; i += 1) {
+    const axis = axes[i];
+    const o = origin[axis];
+    const d = dir[axis];
+    if (Math.abs(d) < 1e-9) {
+      if (o < min[axis] || o > boxMaxTmp[axis]) return null;
+    } else {
+      let t1 = (min[axis] - o) / d;
+      let t2 = (boxMaxTmp[axis] - o) / d;
+      if (t1 > t2) {
+        const swap = t1;
+        t1 = t2;
+        t2 = swap;
+      }
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) return null;
+    }
+  }
+  return tmin;
+}
+
 export function createBots(scene, world, random) {
   const waypoints = world.waypoints;
-  const bodyMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.hairline), roughness: 0.7, metalness: 0.05 });
   const gearMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.surface), roughness: 0.8 });
-  const helmMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.accent), roughness: 0.45, metalness: 0.1 });
   const torsoGeo = new THREE.BoxGeometry(0.52, 0.72, 0.3);
   const headGeo = new THREE.SphereGeometry(0.16, 14, 10);
   const legGeo = new THREE.BoxGeometry(0.2, 0.72, 0.22);
@@ -93,9 +141,21 @@ export function createBots(scene, world, random) {
   const hitMeshes = [];
   let now = 0;
 
-  for (let index = 0; index < 5; index += 1) {
+  const eye = new THREE.Vector3();
+  const toTarget = new THREE.Vector3();
+  const moveDir = new THREE.Vector3();
+
+  // Build one agent's body. Defenders wear ember helmets; teammates wear warm
+  // white ones, so the two sides read at a glance. Torso colour varies per
+  // teammate; defenders all wear rust gear.
+  function buildAgent(team, index, name, torsoColor) {
     const group = new THREE.Group();
-    const torsoMat = bodyMat.clone();
+    const torsoMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE[torsoColor]), roughness: 0.7, metalness: 0.05 });
+    const helmMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(team === 'def' ? PALETTE.accent : PALETTE.ink),
+      roughness: 0.45,
+      metalness: 0.1,
+    });
     const torso = new THREE.Mesh(torsoGeo, torsoMat);
     torso.position.y = 1.02;
     torso.userData.part = 'torso';
@@ -114,15 +174,13 @@ export function createBots(scene, world, random) {
     flash.visible = false;
     group.add(torso, head, legL, legR, gun, flash);
     group.traverse((mesh) => {
-      if (mesh.isMesh) {
-        mesh.castShadow = true;
-      }
+      if (mesh.isMesh) mesh.castShadow = true;
     });
     scene.add(group);
-
-    const bot = {
+    return {
       index,
-      role: ROLES[index],
+      team,
+      name,
       group,
       torso,
       head,
@@ -134,13 +192,14 @@ export function createBots(scene, world, random) {
       health: HEALTH,
       alive: true,
       state: 'hold',
-      holdSpot: HOLD_SPOTS[index],
-      patrol: PATROLS[index],
+      holdSpot: [0, 0],
+      patrol: [],
       patrolIdx: 0,
       path: [],
       pathIdx: 0,
       lastKnown: new THREE.Vector3(),
       hasKnown: false,
+      target: null, // { kind: 'player' | 'mate' | 'def', ref, x, z }
       thinkAt: index * 0.05,
       reactionAt: 0,
       burstLeft: 0,
@@ -149,92 +208,242 @@ export function createBots(scene, world, random) {
       strafeDir: 1,
       strafeAt: 0,
       loseSightAt: 0,
+      investigateAt: 0,
       flashUntil: 0,
       blindUntil: 0,
       defuseT: 0,
+      plantT: 0,
       fall: 0,
       walkPhase: random() * 6,
       speed: PATROL_SPEED,
+      kills: 0,
+      calloutAt: 0,
     };
-    torso.userData.bot = bot;
-    head.userData.bot = bot;
-    hitMeshes.push(torso, head);
+  }
+
+  for (let index = 0; index < 5; index += 1) {
+    const bot = buildAgent('def', index, ['HAVOC', 'SABLE', 'ROOK', 'DUSK', 'FALCON'][index], 'hairline');
+    bot.role = ROLES[index];
+    bot.holdSpot = HOLD_SPOTS[index];
+    bot.patrol = PATROLS[index];
+    bot.state = bot.role === 'site' ? 'hold' : 'patrol';
+    bot.torso.userData.bot = bot;
+    bot.head.userData.bot = bot;
+    hitMeshes.push(bot.torso, bot.head);
     bots.push(bot);
   }
 
-  const eye = new THREE.Vector3();
-  const toPlayer = new THREE.Vector3();
-  const moveDir = new THREE.Vector3();
-  const tmp = new THREE.Vector3();
-
-  function canSee(bot, ctx) {
-    if (!ctx.playerAlive) return false;
-    const px = ctx.playerPos.x;
-    const pz = ctx.playerPos.z;
-    const dx = px - bot.position.x;
-    const dz = pz - bot.position.z;
+  function canSeePoint(agent, tx, tz, eyeY, ctx) {
+    const dx = tx - agent.position.x;
+    const dz = tz - agent.position.z;
     const dist = Math.hypot(dx, dz);
     if (dist > SIGHT_RANGE) return false;
-    const forwardX = -Math.sin(bot.yaw);
-    const forwardZ = -Math.cos(bot.yaw);
+    const forwardX = -Math.sin(agent.yaw);
+    const forwardZ = -Math.cos(agent.yaw);
     if (dist > 0.5 && (dx * forwardX + dz * forwardZ) / dist < Math.cos(SIGHT_HALF_ANGLE)) return false;
-    eye.set(bot.position.x, EYE_HEIGHT, bot.position.z);
-    const playerEye = ctx.playerPos.y + ctx.playerEye;
-    if (world.blocked(eye.x, eye.y, eye.z, px, playerEye, pz)) return false;
-    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, px, playerEye, pz)) return false;
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    if (world.blocked(eye.x, eye.y, eye.z, tx, eyeY, tz)) return false;
+    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, tx, eyeY, tz)) return false;
     return true;
   }
 
-  function setPath(bot, x, z) {
-    const from = nearestNode(waypoints, bot.position.x, bot.position.z);
-    const to = nearestNode(waypoints, x, z);
-    bot.path = findPath(waypoints, from, to);
-    bot.pathIdx = 0;
+  // Nearest visible attacker for a defender: the player, then the teammates.
+  function pickAttacker(agent, ctx) {
+    let best = null;
+    let bestD = Infinity;
+    for (const t of ctx.attackers) {
+      if (!t.alive) continue;
+      const dx = t.x - agent.position.x;
+      const dz = t.z - agent.position.z;
+      const d = dx * dx + dz * dz;
+      if (d >= bestD) continue;
+      if (!canSeePoint(agent, t.x, t.z, t.y + t.eye, ctx)) continue;
+      best = t;
+      bestD = d;
+    }
+    return best;
   }
 
-  function walkPath(bot, dt, speed) {
-    if (bot.pathIdx >= bot.path.length) return true;
-    const node = waypoints[bot.path[bot.pathIdx]];
-    const dx = node[0] - bot.position.x;
-    const dz = node[1] - bot.position.z;
+  function setPath(agent, x, z) {
+    // Rebuild only when the destination itself changes. Rebuilding every
+    // step resets pathIdx to 0, which pins the agent to the nearest
+    // waypoint node forever — and a path only runs node to node, so the
+    // last metres to an off-node target are walked directly (see walkPath).
+    if (agent.path && agent.pathTargetX === x && agent.pathTargetZ === z) return;
+    const from = nearestNode(waypoints, agent.position.x, agent.position.z);
+    const to = nearestNode(waypoints, x, z);
+    agent.path = findPath(waypoints, from, to);
+    agent.pathIdx = 0;
+    agent.pathTargetX = x;
+    agent.pathTargetZ = z;
+  }
+
+  function walkPath(agent, dt, speed) {
+    // Aim at the next path node, or at the exact target once the nodes run
+    // out (a path only runs node to node, so the last metres to an off-node
+    // target are walked directly).
+    const onFinalLeg = agent.pathIdx >= agent.path.length;
+    let tx;
+    let tz;
+    if (!onFinalLeg) {
+      const node = waypoints[agent.path[agent.pathIdx]];
+      tx = node[0];
+      tz = node[1];
+    } else {
+      if (agent.pathTargetX === undefined) return true;
+      tx = agent.pathTargetX;
+      tz = agent.pathTargetZ;
+    }
+    const dx = tx - agent.position.x;
+    const dz = tz - agent.position.z;
     const dist = Math.hypot(dx, dz);
     if (dist < 0.6) {
-      bot.pathIdx += 1;
-      return bot.pathIdx >= bot.path.length;
+      if (!onFinalLeg) {
+        agent.pathIdx += 1;
+        agent.stuckT = 0;
+        agent.lastNodeDist = Infinity;
+        return false;
+      }
+      return true;
     }
-    moveDir.set(dx / dist, 0, dz / dist);
-    bot.yaw = Math.atan2(-moveDir.x, -moveDir.z);
-    moveAxis(bot, moveDir.x * speed * dt, 0);
-    moveAxis(bot, 0, moveDir.z * speed * dt);
-    bot.walkPhase += dt * speed * 2.2;
+    // Stuck detection: if the agent is not closing on its target it is
+    // pressed against a prop. Sidestep around it instead of pushing into
+    // it forever — the map's crates and containers sit on several edges.
+    if (dist > agent.lastNodeDist - 0.02) agent.stuckT = (agent.stuckT || 0) + dt;
+    else agent.stuckT = 0;
+    agent.lastNodeDist = dist;
+    let mx = dx / dist;
+    let mz = dz / dist;
+    if (agent.stuckT > 0.6) {
+      if (!agent.avoidDir) agent.avoidDir = random() < 0.5 ? -1 : 1;
+      const px = -mz * agent.avoidDir;
+      const pz = mx * agent.avoidDir;
+      const inv = 1 / Math.SQRT2;
+      mx = (mx + px) * inv;
+      mz = (mz + pz) * inv;
+      if (agent.stuckT > 1.6) {
+        agent.stuckT = 0;
+        agent.avoidDir = 0;
+      }
+    }
+    agent.yaw = Math.atan2(-mx, -mz);
+    moveAxis(agent, mx * speed * dt, 0);
+    moveAxis(agent, 0, mz * speed * dt);
+    agent.walkPhase += dt * speed * 2.2;
     return false;
   }
 
-  function moveAxis(bot, dx, dz) {
-    const nextX = bot.position.x + dx;
-    if (!world.collides(nextX, 0, bot.position.z, BOT_HEIGHT, BOT_RADIUS, 0.04)) bot.position.x = nextX;
-    const nextZ = bot.position.z + dz;
-    if (!world.collides(bot.position.x, 0, nextZ, BOT_HEIGHT, BOT_RADIUS, 0.04)) bot.position.z = nextZ;
+  function moveAxis(agent, dx, dz) {
+    const nextX = agent.position.x + dx;
+    if (!world.collides(nextX, 0, agent.position.z, BOT_HEIGHT, BOT_RADIUS, 0.04)) agent.position.x = nextX;
+    const nextZ = agent.position.z + dz;
+    if (!world.collides(agent.position.x, 0, nextZ, BOT_HEIGHT, BOT_RADIUS, 0.04)) agent.position.z = nextZ;
   }
 
-  function think(bot, ctx) {
+  function applyDamage(agent, amount) {
+    if (!agent.alive) return false;
+    agent.health -= amount;
+    agent.torsoMat.emissive = new THREE.Color(PALETTE.accent);
+    agent.torsoMat.emissiveIntensity = 0.9;
+    setTimeout(() => {
+      agent.torsoMat.emissiveIntensity = 0;
+    }, 90);
+    if (agent.health > 0) return false;
+    agent.alive = false;
+    agent.fall = 0;
+    agent.state = 'dead';
+    agent.target = null;
+    return true;
+  }
+
+  function targetPoint(agent, ctx) {
+    const t = agent.target;
+    if (!t) return null;
+    if (t.kind === 'player') {
+      if (!ctx.playerAlive) return null;
+      return { x: ctx.playerPos.x, y: ctx.playerPos.y, z: ctx.playerPos.z, eye: ctx.playerEye, height: ctx.playerHeight, speed: ctx.playerSpeed, alive: true };
+    }
+    const ref = t.ref;
+    if (!ref || !ref.alive) return null;
+    return { x: ref.position.x, y: 0, z: ref.position.z, eye: EYE_HEIGHT, height: BOT_HEIGHT, speed: 0, alive: true };
+  }
+
+  // One burst of fire at the agent's current target. Works for either side:
+  // the target is resolved live, the ray is tested against its body box, and
+  // the hit is routed to the player or to an agent.
+  function shootAt(agent, ctx) {
+    const point = targetPoint(agent, ctx);
+    if (!point) return;
+    if (now < agent.reactionAt || now < agent.pauseUntil) return;
+    if (agent.burstLeft <= 0) {
+      agent.burstLeft = BURST_MIN + Math.floor(random() * (BURST_MAX - BURST_MIN + 1));
+      agent.shotAt = now;
+    }
+    if (now - agent.shotAt < SHOT_GAP) return;
+    agent.shotAt = now;
+    agent.burstLeft -= 1;
+    if (agent.burstLeft === 0) agent.pauseUntil = now + 0.6 + random() * 0.5;
+
+    const px = point.x;
+    const py = point.y + point.eye * 0.82;
+    const pz = point.z;
+    const dist = Math.hypot(px - agent.position.x, pz - agent.position.z);
+    const spread = 0.028 + dist * 0.0009 + (point.speed > 3 ? 0.02 : 0);
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    toTarget.set(px - eye.x, py - eye.y, pz - eye.z).normalize();
+    toTarget.x += (random() * 2 - 1) * spread;
+    toTarget.y += (random() * 2 - 1) * spread;
+    toTarget.z += (random() * 2 - 1) * spread;
+    toTarget.normalize();
+    agent.flash.visible = true;
+    agent.flashUntil = now + 0.05;
+    ctx.onAgentShot(agent, eye, toTarget);
+
+    // The shot is a ray against the target's body box and head sphere.
+    boxMinTmp.set(px - BOT_RADIUS, point.y, pz - BOT_RADIUS);
+    boxMaxTmp.set(px + BOT_RADIUS, point.y + point.height, pz + BOT_RADIUS);
+    const hit = rayHitsBox(eye, toTarget, boxMinTmp, boxMaxTmp);
+    if (hit === null) return;
+    if (world.blocked(eye.x, eye.y, eye.z, eye.x + toTarget.x * hit, eye.y + toTarget.y * hit, eye.z + toTarget.z * hit)) return;
+    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, eye.x + toTarget.x * hit, eye.y + toTarget.y * hit, eye.z + toTarget.z * hit)) return;
+    const hitY = eye.y + toTarget.y * hit;
+    const isHead = hitY > point.y + point.eye + 0.08;
+    const dmg = isHead ? DAMAGE * HEAD_MULT : DAMAGE;
+    const target = agent.target;
+    if (target.kind === 'player') {
+      ctx.onPlayerHit(dmg, isHead, agent);
+      return;
+    }
+    const victim = target.ref;
+    const killed = applyDamage(victim, dmg);
+    if (!killed) return;
+    agent.kills += 1;
+    ctx.onKillFeed(`${agent.name} — ${victim.name}${isHead ? ' (headshot)' : ''}`);
+    if (victim.team === 'def') ctx.onDefenderDown(victim);
+    else ctx.onMateDown(victim);
+  }
+
+  function thinkDefender(bot, ctx) {
     if (now < bot.thinkAt) return;
     bot.thinkAt = now + 0.12 + random() * 0.06;
     if (now < bot.blindUntil) return;
-    const seen = canSee(bot, ctx);
+    const seen = pickAttacker(bot, ctx);
     if (seen) {
-      bot.lastKnown.set(ctx.playerPos.x, 0, ctx.playerPos.z);
+      bot.lastKnown.set(seen.x, 0, seen.z);
       bot.hasKnown = true;
       if (bot.state !== 'engage') {
         bot.state = 'engage';
         bot.reactionAt = now + 0.35 + random() * 0.3;
         bot.burstLeft = 0;
       }
+      bot.target = seen;
       bot.loseSightAt = now + 1.2;
       return;
     }
     if (bot.state === 'engage' && now > bot.loseSightAt) {
       bot.state = 'investigate';
+      bot.investigateAt = now;
+      bot.target = null;
       setPath(bot, bot.lastKnown.x, bot.lastKnown.z);
     }
     if (bot.state !== 'engage' && ctx.noise) {
@@ -246,6 +455,7 @@ export function createBots(scene, world, random) {
           bot.lastKnown.set(event.x, 0, event.z);
           bot.hasKnown = true;
           bot.state = 'investigate';
+          bot.investigateAt = now;
           setPath(bot, event.x, event.z);
           break;
         }
@@ -253,82 +463,14 @@ export function createBots(scene, world, random) {
     }
   }
 
-  function shoot(bot, ctx) {
-    if (now < bot.reactionAt || now < bot.pauseUntil) return;
-    if (bot.burstLeft <= 0) {
-      bot.burstLeft = BURST_MIN + Math.floor(random() * (BURST_MAX - BURST_MIN + 1));
-      bot.shotAt = now;
-    }
-    if (now - bot.shotAt < SHOT_GAP) return;
-    bot.shotAt = now;
-    bot.burstLeft -= 1;
-    if (bot.burstLeft === 0) bot.pauseUntil = now + 0.6 + random() * 0.5;
-
-    const px = ctx.playerPos.x;
-    const py = ctx.playerPos.y + ctx.playerEye * 0.82;
-    const pz = ctx.playerPos.z;
-    const dist = Math.hypot(px - bot.position.x, pz - bot.position.z);
-    const spread = 0.028 + dist * 0.0009 + (ctx.playerSpeed > 3 ? 0.02 : 0);
-    eye.set(bot.position.x, EYE_HEIGHT, bot.position.z);
-    toPlayer.set(px - eye.x, py - eye.y, pz - eye.z).normalize();
-    toPlayer.x += (random() * 2 - 1) * spread;
-    toPlayer.y += (random() * 2 - 1) * spread;
-    toPlayer.z += (random() * 2 - 1) * spread;
-    toPlayer.normalize();
-    bot.flash.visible = true;
-    bot.flashUntil = now + 0.05;
-    ctx.onBotShot(bot, eye, toPlayer);
-
-    // The shot is a ray against the player's body box and head sphere.
-    boxMinTmp.set(px - BOT_RADIUS, ctx.playerPos.y, pz - BOT_RADIUS);
-    boxMaxTmp.set(px + BOT_RADIUS, ctx.playerPos.y + ctx.playerHeight, pz + BOT_RADIUS);
-    const hit = rayHitsBox(eye, toPlayer, boxMinTmp, boxMaxTmp);
-    if (hit === null) return;
-    if (world.blocked(eye.x, eye.y, eye.z, eye.x + toPlayer.x * hit, eye.y + toPlayer.y * hit, eye.z + toPlayer.z * hit)) return;
-    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, eye.x + toPlayer.x * hit, eye.y + toPlayer.y * hit, eye.z + toPlayer.z * hit)) return;
-    const hitY = eye.y + toPlayer.y * hit;
-    const isHead = hitY > ctx.playerPos.y + ctx.playerEye + 0.08;
-    ctx.onPlayerHit(isHead ? DAMAGE * HEAD_MULT : DAMAGE, isHead, bot);
-  }
-
-  // Slab test: distance along the ray to a box, or null. The caller reuses its
-  // two box vectors; this function allocates nothing.
-  const boxMaxTmp = new THREE.Vector3();
-  const boxMinTmp = new THREE.Vector3();
-  function rayHitsBox(origin, dir, min, max) {
-    boxMaxTmp.copy(max);
-    let tmin = 0;
-    let tmax = Infinity;
-    const axes = ['x', 'y', 'z'];
-    for (const axis of axes) {
-      const o = origin[axis];
-      const d = dir[axis];
-      if (Math.abs(d) < 1e-9) {
-        if (o < min[axis] || o > boxMaxTmp[axis]) return null;
-      } else {
-        let t1 = (min[axis] - o) / d;
-        let t2 = (boxMaxTmp[axis] - o) / d;
-        if (t1 > t2) {
-          const swap = t1;
-          t1 = t2;
-          t2 = swap;
-        }
-        tmin = Math.max(tmin, t1);
-        tmax = Math.min(tmax, t2);
-        if (tmin > tmax) return null;
-      }
-    }
-    return tmin;
-  }
-
-  function stepBot(bot, dt, ctx) {
+  function stepDefender(bot, dt, ctx) {
     if (!bot.alive) {
       bot.fall = Math.min(1, bot.fall + dt / FALL_SECONDS);
       bot.group.rotation.x = -bot.fall * 1.5;
       bot.group.position.y = -bot.fall * 0.1;
       return;
     }
-    think(bot, ctx);
+    thinkDefender(bot, ctx);
     if (now < bot.blindUntil) {
       bot.group.position.copy(bot.position);
       return;
@@ -353,36 +495,47 @@ export function createBots(scene, world, random) {
     }
 
     if (bot.state === 'engage') {
-      const dx = ctx.playerPos.x - bot.position.x;
-      const dz = ctx.playerPos.z - bot.position.z;
-      const dist = Math.hypot(dx, dz);
-      bot.yaw = Math.atan2(-dx, -dz);
-      if (now > bot.strafeAt) {
-        bot.strafeAt = now + 1.2 + random() * 0.8;
-        bot.strafeDir = random() < 0.5 ? -1 : 1;
-      }
-      if (dist > 14) {
-        moveDir.set(dx / dist, 0, dz / dist);
-        moveAxis(bot, moveDir.x * AIM_SPEED * dt, 0);
-        moveAxis(bot, 0, moveDir.z * AIM_SPEED * dt);
-      } else if (dist < 5) {
-        moveDir.set(-dx / dist, 0, -dz / dist);
-        moveAxis(bot, moveDir.x * AIM_SPEED * dt, 0);
-        moveAxis(bot, 0, moveDir.z * AIM_SPEED * dt);
+      const point = targetPoint(bot, ctx);
+      if (!point) {
+        bot.state = 'investigate';
+        bot.investigateAt = now;
+        bot.target = null;
+        setPath(bot, bot.lastKnown.x, bot.lastKnown.z);
       } else {
-        const sx = (-dz / dist) * bot.strafeDir;
-        const sz = (dx / dist) * bot.strafeDir;
-        moveAxis(bot, sx * AIM_SPEED * dt, 0);
-        moveAxis(bot, 0, sz * AIM_SPEED * dt);
+        const dx = point.x - bot.position.x;
+        const dz = point.z - bot.position.z;
+        const dist = Math.hypot(dx, dz);
+        bot.yaw = Math.atan2(-dx, -dz);
+        if (now > bot.strafeAt) {
+          bot.strafeAt = now + 1.2 + random() * 0.8;
+          bot.strafeDir = random() < 0.5 ? -1 : 1;
+        }
+        if (dist > 14) {
+          moveDir.set(dx / dist, 0, dz / dist);
+          moveAxis(bot, moveDir.x * AIM_SPEED * dt, 0);
+          moveAxis(bot, 0, moveDir.z * AIM_SPEED * dt);
+        } else if (dist < 5) {
+          moveDir.set(-dx / dist, 0, -dz / dist);
+          moveAxis(bot, moveDir.x * AIM_SPEED * dt, 0);
+          moveAxis(bot, 0, moveDir.z * AIM_SPEED * dt);
+        } else {
+          const sx = (-dz / dist) * bot.strafeDir;
+          const sz = (dx / dist) * bot.strafeDir;
+          moveAxis(bot, sx * AIM_SPEED * dt, 0);
+          moveAxis(bot, 0, sz * AIM_SPEED * dt);
+        }
+        shootAt(bot, ctx);
       }
-      if (ctx.playerAlive) shoot(bot, ctx);
       bot.group.position.copy(bot.position);
       bot.group.rotation.y = bot.yaw;
       return;
     }
 
     if (bot.state === 'investigate') {
-      if (walkPath(bot, dt, HUNT_SPEED)) {
+      // Give up after 8 s without reaching the spot: a target that cannot
+      // be reached (or a last-known that keeps sliding) must not pin the
+      // agent in place for the rest of the round.
+      if (walkPath(bot, dt, HUNT_SPEED) || now - bot.investigateAt > 8) {
         bot.state = bot.role === 'site' ? 'hold' : 'patrol';
         bot.patrolIdx = 0;
       }
@@ -424,26 +577,9 @@ export function createBots(scene, world, random) {
     hitMeshes,
     step(dt, time, ctx) {
       now = time;
-      for (const bot of bots) stepBot(bot, dt, ctx);
-      // After the bomb is planted, the closest living bot goes to defuse it.
-      if (ctx.bombPlanted && ctx.playerAlive === false) {
-        let best = null;
-        let bestDist = Infinity;
-        for (const bot of bots) {
-          if (!bot.alive || bot.state === 'defuse') continue;
-          const dx = ctx.bomb.x - bot.position.x;
-          const dz = ctx.bomb.z - bot.position.z;
-          const d = dx * dx + dz * dz;
-          if (d < bestDist) {
-            bestDist = d;
-            best = bot;
-          }
-        }
-        if (best && best.state !== 'defuse') {
-          best.state = 'defuse';
-          best.defuseT = 0;
-        }
-      } else if (ctx.bombPlanted) {
+      for (const bot of bots) stepDefender(bot, dt, ctx);
+      // After the bomb is planted, the closest living defender goes to defuse it.
+      if (ctx.bombPlanted) {
         let defuser = null;
         for (const bot of bots) if (bot.alive && bot.state === 'defuse') defuser = bot;
         if (!defuser) {
@@ -469,17 +605,7 @@ export function createBots(scene, world, random) {
     damage(mesh, amount) {
       const bot = mesh.userData.bot;
       if (!bot || !bot.alive) return false;
-      bot.health -= amount;
-      bot.torsoMat.emissive = new THREE.Color(PALETTE.accent);
-      bot.torsoMat.emissiveIntensity = 0.9;
-      setTimeout(() => {
-        bot.torsoMat.emissiveIntensity = 0;
-      }, 90);
-      if (bot.health > 0) return false;
-      bot.alive = false;
-      bot.fall = 0;
-      bot.state = 'dead';
-      return true;
+      return applyDamage(bot, amount);
     },
     aliveCount() {
       return bots.filter((bot) => bot.alive).length;
@@ -497,18 +623,517 @@ export function createBots(scene, world, random) {
         bot.health = HEALTH;
         bot.alive = true;
         bot.state = bot.role === 'site' ? 'hold' : 'patrol';
+        bot.target = null;
         bot.patrolIdx = 0;
-        bot.path = [];
+        bot.path = null;
         bot.pathIdx = 0;
+        bot.stuckT = 0;
+        bot.lastNodeDist = Infinity;
+        bot.avoidDir = 0;
+        bot.investigateAt = 0;
         bot.hasKnown = false;
         bot.burstLeft = 0;
         bot.pauseUntil = 0;
         bot.defuseT = 0;
+        bot.plantT = 0;
         bot.fall = 0;
         bot.blindUntil = 0;
+        bot.kills = 0;
+        bot.calloutAt = 0;
         bot.group.rotation.set(0, bot.yaw, 0);
         bot.group.position.copy(bot.position);
         bot.torsoMat.emissiveIntensity = 0;
+      }
+    },
+  };
+}
+
+export function createTeammates(scene, world, random) {
+  const waypoints = world.waypoints;
+  const gearMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.surface), roughness: 0.8 });
+  const torsoGeo = new THREE.BoxGeometry(0.52, 0.72, 0.3);
+  const headGeo = new THREE.SphereGeometry(0.16, 14, 10);
+  const legGeo = new THREE.BoxGeometry(0.2, 0.72, 0.22);
+  const gunGeo = new THREE.BoxGeometry(0.07, 0.09, 0.55);
+  const flashGeo = new THREE.PlaneGeometry(0.3, 0.3);
+
+  const mates = [];
+  let now = 0;
+
+  const eye = new THREE.Vector3();
+  const toTarget = new THREE.Vector3();
+  const moveDir = new THREE.Vector3();
+
+  function buildMate(index) {
+    const group = new THREE.Group();
+    const torsoMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE[TEAM_TORSO[index]]), roughness: 0.7, metalness: 0.05 });
+    const helmMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.ink), roughness: 0.45, metalness: 0.1 });
+    const torso = new THREE.Mesh(torsoGeo, torsoMat);
+    torso.position.y = 1.02;
+    torso.userData.part = 'torso';
+    const head = new THREE.Mesh(headGeo, helmMat);
+    head.position.y = 1.56;
+    head.userData.part = 'head';
+    const legL = new THREE.Mesh(legGeo, gearMat);
+    legL.position.set(-0.14, 0.36, 0);
+    const legR = new THREE.Mesh(legGeo, gearMat);
+    legR.position.set(0.14, 0.36, 0);
+    const gun = new THREE.Mesh(gunGeo, gearMat);
+    gun.position.set(0.24, 1.05, -0.32);
+    const flashMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide });
+    const flash = new THREE.Mesh(flashGeo, flashMat);
+    flash.position.set(0.24, 1.05, -0.72);
+    flash.visible = false;
+    group.add(torso, head, legL, legR, gun, flash);
+    group.traverse((mesh) => {
+      if (mesh.isMesh) mesh.castShadow = true;
+    });
+    scene.add(group);
+    return {
+      index,
+      team: 'att',
+      name: TEAM_NAMES[index],
+      group,
+      torso,
+      head,
+      gun,
+      flash,
+      torsoMat,
+      position: new THREE.Vector3(),
+      yaw: 0,
+      health: HEALTH,
+      alive: true,
+      state: 'patrol',
+      holdSpot: TEAM_HOLD[index],
+      patrol: TEAM_PATROLS[index],
+      patrolIdx: 0,
+      path: [],
+      pathIdx: 0,
+      lastKnown: new THREE.Vector3(),
+      hasKnown: false,
+      target: null,
+      thinkAt: index * 0.05,
+      reactionAt: 0,
+      burstLeft: 0,
+      shotAt: 0,
+      pauseUntil: 0,
+      strafeDir: 1,
+      strafeAt: 0,
+      loseSightAt: 0,
+      investigateAt: 0,
+      flashUntil: 0,
+      blindUntil: 0,
+      defuseT: 0,
+      plantT: 0,
+      fall: 0,
+      walkPhase: random() * 6,
+      speed: PATROL_SPEED,
+      kills: 0,
+      calloutAt: 0,
+    };
+  }
+
+  for (let index = 0; index < 4; index += 1) mates.push(buildMate(index));
+
+  function canSeePoint(agent, tx, tz, eyeY, ctx) {
+    const dx = tx - agent.position.x;
+    const dz = tz - agent.position.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > SIGHT_RANGE) return false;
+    const forwardX = -Math.sin(agent.yaw);
+    const forwardZ = -Math.cos(agent.yaw);
+    if (dist > 0.5 && (dx * forwardX + dz * forwardZ) / dist < Math.cos(SIGHT_HALF_ANGLE)) return false;
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    if (world.blocked(eye.x, eye.y, eye.z, tx, eyeY, tz)) return false;
+    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, tx, eyeY, tz)) return false;
+    return true;
+  }
+
+  function pickDefender(agent, ctx) {
+    let best = null;
+    let bestD = Infinity;
+    for (const def of ctx.defenders) {
+      if (!def.alive) continue;
+      const dx = def.position.x - agent.position.x;
+      const dz = def.position.z - agent.position.z;
+      const d = dx * dx + dz * dz;
+      if (d >= bestD) continue;
+      if (!canSeePoint(agent, def.position.x, def.position.z, EYE_HEIGHT, ctx)) continue;
+      best = def;
+      bestD = d;
+    }
+    return best;
+  }
+
+  function nearestDefenderWithin(agent, ctx, radius) {
+    for (const def of ctx.defenders) {
+      if (!def.alive) continue;
+      const dx = def.position.x - agent.position.x;
+      const dz = def.position.z - agent.position.z;
+      if (dx * dx + dz * dz < radius * radius) return true;
+    }
+    return false;
+  }
+
+  function setPath(agent, x, z) {
+    // Rebuild only when the destination itself changes. Rebuilding every
+    // step resets pathIdx to 0, which pins the agent to the nearest
+    // waypoint node forever — and a path only runs node to node, so the
+    // last metres to an off-node target are walked directly (see walkPath).
+    if (agent.path && agent.pathTargetX === x && agent.pathTargetZ === z) return;
+    const from = nearestNode(waypoints, agent.position.x, agent.position.z);
+    const to = nearestNode(waypoints, x, z);
+    agent.path = findPath(waypoints, from, to);
+    agent.pathIdx = 0;
+    agent.pathTargetX = x;
+    agent.pathTargetZ = z;
+  }
+
+  function walkPath(agent, dt, speed) {
+    // Aim at the next path node, or at the exact target once the nodes run
+    // out (a path only runs node to node, so the last metres to an off-node
+    // target are walked directly).
+    const onFinalLeg = agent.pathIdx >= agent.path.length;
+    let tx;
+    let tz;
+    if (!onFinalLeg) {
+      const node = waypoints[agent.path[agent.pathIdx]];
+      tx = node[0];
+      tz = node[1];
+    } else {
+      if (agent.pathTargetX === undefined) return true;
+      tx = agent.pathTargetX;
+      tz = agent.pathTargetZ;
+    }
+    const dx = tx - agent.position.x;
+    const dz = tz - agent.position.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 0.6) {
+      if (!onFinalLeg) {
+        agent.pathIdx += 1;
+        agent.stuckT = 0;
+        agent.lastNodeDist = Infinity;
+        return false;
+      }
+      return true;
+    }
+    // Stuck detection: if the agent is not closing on its target it is
+    // pressed against a prop. Sidestep around it instead of pushing into
+    // it forever — the map's crates and containers sit on several edges.
+    if (dist > agent.lastNodeDist - 0.02) agent.stuckT = (agent.stuckT || 0) + dt;
+    else agent.stuckT = 0;
+    agent.lastNodeDist = dist;
+    let mx = dx / dist;
+    let mz = dz / dist;
+    if (agent.stuckT > 0.6) {
+      if (!agent.avoidDir) agent.avoidDir = random() < 0.5 ? -1 : 1;
+      const px = -mz * agent.avoidDir;
+      const pz = mx * agent.avoidDir;
+      const inv = 1 / Math.SQRT2;
+      mx = (mx + px) * inv;
+      mz = (mz + pz) * inv;
+      if (agent.stuckT > 1.6) {
+        agent.stuckT = 0;
+        agent.avoidDir = 0;
+      }
+    }
+    agent.yaw = Math.atan2(-mx, -mz);
+    moveAxis(agent, mx * speed * dt, 0);
+    moveAxis(agent, 0, mz * speed * dt);
+    agent.walkPhase += dt * speed * 2.2;
+    return false;
+  }
+
+  function moveAxis(agent, dx, dz) {
+    const nextX = agent.position.x + dx;
+    if (!world.collides(nextX, 0, agent.position.z, BOT_HEIGHT, BOT_RADIUS, 0.04)) agent.position.x = nextX;
+    const nextZ = agent.position.z + dz;
+    if (!world.collides(agent.position.x, 0, nextZ, BOT_HEIGHT, BOT_RADIUS, 0.04)) agent.position.z = nextZ;
+  }
+
+  function applyDamage(agent, amount) {
+    if (!agent.alive) return false;
+    agent.health -= amount;
+    agent.torsoMat.emissive = new THREE.Color(PALETTE.accent);
+    agent.torsoMat.emissiveIntensity = 0.9;
+    setTimeout(() => {
+      agent.torsoMat.emissiveIntensity = 0;
+    }, 90);
+    if (agent.health > 0) return false;
+    agent.alive = false;
+    agent.fall = 0;
+    agent.state = 'dead';
+    agent.target = null;
+    return true;
+  }
+
+  function targetPoint(agent, ctx) {
+    const ref = agent.target;
+    if (!ref || !ref.alive) return null;
+    return { x: ref.position.x, y: 0, z: ref.position.z, eye: EYE_HEIGHT, height: BOT_HEIGHT, speed: 0, alive: true };
+  }
+
+  function shootAt(agent, ctx) {
+    const point = targetPoint(agent, ctx);
+    if (!point) return;
+    if (now < agent.reactionAt || now < agent.pauseUntil) return;
+    if (agent.burstLeft <= 0) {
+      agent.burstLeft = BURST_MIN + Math.floor(random() * (BURST_MAX - BURST_MIN + 1));
+      agent.shotAt = now;
+    }
+    if (now - agent.shotAt < SHOT_GAP) return;
+    agent.shotAt = now;
+    agent.burstLeft -= 1;
+    if (agent.burstLeft === 0) agent.pauseUntil = now + 0.6 + random() * 0.5;
+
+    const px = point.x;
+    const py = point.y + point.eye * 0.82;
+    const pz = point.z;
+    const dist = Math.hypot(px - agent.position.x, pz - agent.position.z);
+    const spread = 0.028 + dist * 0.0009;
+    eye.set(agent.position.x, EYE_HEIGHT, agent.position.z);
+    toTarget.set(px - eye.x, py - eye.y, pz - eye.z).normalize();
+    toTarget.x += (random() * 2 - 1) * spread;
+    toTarget.y += (random() * 2 - 1) * spread;
+    toTarget.z += (random() * 2 - 1) * spread;
+    toTarget.normalize();
+    agent.flash.visible = true;
+    agent.flashUntil = now + 0.05;
+    ctx.onAgentShot(agent, eye, toTarget);
+
+    boxMinTmp.set(px - BOT_RADIUS, point.y, pz - BOT_RADIUS);
+    boxMaxTmp.set(px + BOT_RADIUS, point.y + point.height, pz + BOT_RADIUS);
+    const hit = rayHitsBox(eye, toTarget, boxMinTmp, boxMaxTmp);
+    if (hit === null) return;
+    if (world.blocked(eye.x, eye.y, eye.z, eye.x + toTarget.x * hit, eye.y + toTarget.y * hit, eye.z + toTarget.z * hit)) return;
+    if (ctx.smokeBlocks && ctx.smokeBlocks(eye.x, eye.y, eye.z, eye.x + toTarget.x * hit, eye.y + toTarget.y * hit, eye.z + toTarget.z * hit)) return;
+    const hitY = eye.y + toTarget.y * hit;
+    const isHead = hitY > point.y + point.eye + 0.08;
+    const dmg = isHead ? DAMAGE * HEAD_MULT : DAMAGE;
+    const victim = agent.target;
+    const killed = applyDamage(victim, dmg);
+    if (!killed) return;
+    agent.kills += 1;
+    ctx.onKillFeed(`${agent.name} — ${victim.name}${isHead ? ' (headshot)' : ''}`);
+    ctx.onDefenderDown(victim);
+  }
+
+  function callout(mate, ctx, text) {
+    if (now < mate.calloutAt) return;
+    mate.calloutAt = now + 7;
+    ctx.onCallout(text);
+  }
+
+  function thinkMate(mate, ctx) {
+    if (now < mate.thinkAt) return;
+    mate.thinkAt = now + 0.12 + random() * 0.06;
+    if (now < mate.blindUntil) return;
+    const seen = pickDefender(mate, ctx);
+    if (seen) {
+      mate.lastKnown.set(seen.position.x, 0, seen.position.z);
+      mate.hasKnown = true;
+      if (mate.state !== 'engage') {
+        mate.state = 'engage';
+        mate.reactionAt = now + 0.35 + random() * 0.3;
+        mate.burstLeft = 0;
+        callout(mate, ctx, `${mate.name}: Contact — ${seen.name} in sight!`);
+      }
+      mate.target = seen;
+      mate.loseSightAt = now + 1.2;
+      return;
+    }
+    if (mate.state === 'engage' && now > mate.loseSightAt) {
+      mate.state = 'investigate';
+      mate.investigateAt = now;
+      mate.target = null;
+      setPath(mate, mate.lastKnown.x, mate.lastKnown.z);
+    }
+    // Reach Site A with the coast clear and the bomb still in hand: plant it.
+    // Only from a calm state — never mid-fight.
+    if ((mate.state === 'patrol' || mate.state === 'hold') && ctx.bombLive() === 'idle' && ctx.inSite(mate.position.x, mate.position.z) && !nearestDefenderWithin(mate, ctx, 14)) {
+      mate.state = 'plant';
+      mate.plantT = 0;
+      callout(mate, ctx, `${mate.name}: Planting at Site A — cover me!`);
+      ctx.onMateStartPlant(mate);
+    }
+    if (mate.state !== 'engage' && ctx.noise) {
+      for (const event of ctx.noise) {
+        if (now - event.at > 2) continue;
+        const dx = event.x - mate.position.x;
+        const dz = event.z - mate.position.z;
+        if (dx * dx + dz * dz < event.radius * event.radius) {
+          mate.lastKnown.set(event.x, 0, event.z);
+          mate.hasKnown = true;
+          mate.state = 'investigate';
+          mate.investigateAt = now;
+          setPath(mate, event.x, event.z);
+          break;
+        }
+      }
+    }
+  }
+
+  function stepMate(mate, dt, ctx) {
+    if (!mate.alive) {
+      mate.fall = Math.min(1, mate.fall + dt / FALL_SECONDS);
+      mate.group.rotation.x = -mate.fall * 1.5;
+      mate.group.position.y = -mate.fall * 0.1;
+      return;
+    }
+    thinkMate(mate, ctx);
+    if (now < mate.blindUntil) {
+      mate.group.position.copy(mate.position);
+      return;
+    }
+    mate.flash.visible = now < mate.flashUntil;
+
+    if (mate.state === 'plant') {
+      // Stand still and hold the plant. Only a defender closing in breaks it
+      // off — being watched from across the yard does not, or the plant could
+      // never finish while any defender holds an angle on the site. The bomb
+      // status is read live: the context snapshot is taken before thinkMate
+      // runs, so it still says 'idle' in the very step the plant starts.
+      const close = nearestDefenderWithin(mate, ctx, 12);
+      const seen = close ? pickDefender(mate, ctx) : null;
+      const live = ctx.bombLive();
+      if (live === 'planted') {
+        // The charge is in — hold the site.
+        mate.state = 'hold';
+        mate.target = null;
+      } else if (close || !ctx.inSite(mate.position.x, mate.position.z) || live !== 'planting') {
+        if (live === 'planting') ctx.onMateCancelPlant(mate);
+        mate.state = seen ? 'engage' : 'patrol';
+        mate.target = seen || null;
+        if (seen) {
+          mate.reactionAt = now + 0.35;
+          mate.burstLeft = 0;
+        }
+      } else {
+        mate.yaw = Math.atan2(-(ctx.bomb.x - mate.position.x), -(ctx.bomb.z - mate.position.z));
+      }
+      mate.group.position.copy(mate.position);
+      mate.group.rotation.y = mate.yaw;
+      return;
+    }
+
+    if (mate.state === 'engage') {
+      const point = targetPoint(mate, ctx);
+      if (!point) {
+        mate.state = 'investigate';
+        mate.investigateAt = now;
+        mate.target = null;
+        setPath(mate, mate.lastKnown.x, mate.lastKnown.z);
+      } else {
+        const dx = point.x - mate.position.x;
+        const dz = point.z - mate.position.z;
+        const dist = Math.hypot(dx, dz);
+        mate.yaw = Math.atan2(-dx, -dz);
+        if (now > mate.strafeAt) {
+          mate.strafeAt = now + 1.2 + random() * 0.8;
+          mate.strafeDir = random() < 0.5 ? -1 : 1;
+        }
+        if (dist > 14) {
+          moveDir.set(dx / dist, 0, dz / dist);
+          moveAxis(mate, moveDir.x * AIM_SPEED * dt, 0);
+          moveAxis(mate, 0, moveDir.z * AIM_SPEED * dt);
+        } else if (dist < 5) {
+          moveDir.set(-dx / dist, 0, -dz / dist);
+          moveAxis(mate, moveDir.x * AIM_SPEED * dt, 0);
+          moveAxis(mate, 0, moveDir.z * AIM_SPEED * dt);
+        } else {
+          const sx = (-dz / dist) * mate.strafeDir;
+          const sz = (dx / dist) * mate.strafeDir;
+          moveAxis(mate, sx * AIM_SPEED * dt, 0);
+          moveAxis(mate, 0, sz * AIM_SPEED * dt);
+        }
+        shootAt(mate, ctx);
+      }
+      mate.group.position.copy(mate.position);
+      mate.group.rotation.y = mate.yaw;
+      return;
+    }
+
+    if (mate.state === 'investigate') {
+      // Same 8 s give-up as the defenders: never pin the squad in place.
+      if (walkPath(mate, dt, HUNT_SPEED) || now - mate.investigateAt > 8) {
+        mate.state = ctx.bombPlanted ? 'hold' : 'patrol';
+        mate.patrolIdx = 0;
+      }
+      mate.group.position.copy(mate.position);
+      mate.group.rotation.y = mate.yaw;
+      return;
+    }
+
+    if (mate.state === 'patrol') {
+      const spot = mate.patrol[mate.patrolIdx % mate.patrol.length];
+      const dx = spot[0] - mate.position.x;
+      const dz = spot[1] - mate.position.z;
+      if (Math.hypot(dx, dz) < 0.8) {
+        mate.patrolIdx += 1;
+        if (mate.patrolIdx >= mate.patrol.length) {
+          // Reached the end of the push: hold the site.
+          mate.state = 'hold';
+        }
+      } else {
+        setPath(mate, spot[0], spot[1]);
+        walkPath(mate, dt, PATROL_SPEED);
+      }
+      mate.group.position.copy(mate.position);
+      mate.group.rotation.y = mate.yaw;
+      return;
+    }
+
+    // hold: stand at the hold spot near the site, scan slowly.
+    const hx = mate.holdSpot[0] - mate.position.x;
+    const hz = mate.holdSpot[1] - mate.position.z;
+    if (Math.hypot(hx, hz) > 0.5) {
+      setPath(mate, mate.holdSpot[0], mate.holdSpot[1]);
+      walkPath(mate, dt, PATROL_SPEED);
+    } else {
+      mate.yaw += Math.sin(now * 0.5 + mate.index * 2.1) * 0.0035;
+    }
+    mate.group.position.copy(mate.position);
+    mate.group.rotation.y = mate.yaw;
+  }
+
+  return {
+    mates,
+    step(dt, time, ctx) {
+      now = time;
+      for (const mate of mates) stepMate(mate, dt, ctx);
+    },
+    aliveCount() {
+      return mates.filter((mate) => mate.alive).length;
+    },
+    reset(spawns) {
+      for (let i = 0; i < mates.length; i += 1) {
+        const mate = mates[i];
+        const spawn = spawns[i % spawns.length];
+        mate.position.set(spawn.x, 0, spawn.z);
+        mate.yaw = Math.PI;
+        mate.health = HEALTH;
+        mate.alive = true;
+        mate.state = 'patrol';
+        mate.target = null;
+        mate.patrolIdx = 0;
+        mate.path = null;
+        mate.pathIdx = 0;
+        mate.stuckT = 0;
+        mate.lastNodeDist = Infinity;
+        mate.avoidDir = 0;
+        mate.investigateAt = 0;
+        mate.hasKnown = false;
+        mate.burstLeft = 0;
+        mate.pauseUntil = 0;
+        mate.defuseT = 0;
+        mate.plantT = 0;
+        mate.fall = 0;
+        mate.blindUntil = 0;
+        mate.kills = 0;
+        mate.calloutAt = 0;
+        mate.group.rotation.set(0, mate.yaw, 0);
+        mate.group.position.copy(mate.position);
+        mate.torsoMat.emissiveIntensity = 0;
       }
     },
   };

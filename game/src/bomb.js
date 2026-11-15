@@ -23,7 +23,7 @@ export function createBomb(scene, site) {
   group.visible = false;
   scene.add(group);
 
-  const state = { status: 'idle', plantT: 0, fuse: FUSE_SECONDS, beepAt: 0 };
+  const state = { status: 'idle', plantT: 0, fuse: FUSE_SECONDS, beepAt: 0, planter: null };
   let beepCount = 0;
 
   return {
@@ -33,18 +33,21 @@ export function createBomb(scene, site) {
       state.status = 'idle';
       state.plantT = 0;
       state.fuse = FUSE_SECONDS;
+      state.planter = null;
       beepCount = 0;
       group.visible = false;
     },
-    startPlant() {
+    startPlant(planter = 'player') {
       if (state.status !== 'idle') return;
       state.status = 'planting';
+      state.planter = planter;
       state.plantT = 0;
     },
     cancelPlant() {
       if (state.status === 'planting') {
         state.status = 'idle';
         state.plantT = 0;
+        state.planter = null;
       }
     },
     progress() {
@@ -52,6 +55,7 @@ export function createBomb(scene, site) {
     },
     plant() {
       state.status = 'planted';
+      state.planter = null;
       state.fuse = FUSE_SECONDS;
       state.beepAt = 0;
       beepCount = 0;
@@ -59,6 +63,7 @@ export function createBomb(scene, site) {
     },
     defuse() {
       state.status = 'defused';
+      state.planter = null;
       group.visible = false;
     },
     step(dt, audio) {
